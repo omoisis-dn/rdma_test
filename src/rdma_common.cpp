@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <errno.h>
 
 int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint16_t port) {
     // Get device list
@@ -300,18 +301,58 @@ int exchange_qp_info_client(int sockfd, RDMAConnection& conn) {
 }
 
 int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
+    // Query port attributes to get actual MTU
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(conn.context, conn.port_num, &port_attr)) {
+        std::cerr << "Failed to query port attributes" << std::endl;
+        return -1;
+    }
+    
+    // Check if port is active
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        std::cerr << "Port is not active (state: " << port_attr.state << ")" << std::endl;
+        return -1;
+    }
+    
+    // Query device attributes to get capabilities
+    struct ibv_device_attr device_attr;
+    if (ibv_query_device(conn.context, &device_attr)) {
+        std::cerr << "Failed to query device attributes" << std::endl;
+        return -1;
+    }
+    
+    // Use the actual port MTU (or a smaller one if 4096 is not supported)
+    enum ibv_mtu path_mtu = port_attr.max_mtu;
+    if (path_mtu > IBV_MTU_2048) {
+        path_mtu = IBV_MTU_2048;  // Use 2048 as a safe default
+    }
+    
+    // Get max atomic capabilities (use minimum of device capabilities)
+    // If device doesn't support atomic operations, use 0
+    uint8_t max_dest_rd_atomic = (device_attr.max_qp_rd_atom < 16) ? device_attr.max_qp_rd_atom : 16;
+    
+    uint8_t max_rd_atomic = (device_attr.max_qp_init_rd_atom < 16) ? device_attr.max_qp_init_rd_atom : 16;
+    
     // Transition to RTR (Ready to Receive)
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = IBV_MTU_4096;
+    attr.path_mtu = path_mtu;
     attr.dest_qp_num = remote_info.qp_num;
     attr.rq_psn = 0;
-    attr.max_dest_rd_atomic = 16;
+    attr.max_dest_rd_atomic = max_dest_rd_atomic;
     attr.min_rnr_timer = 12;
     
     struct ibv_ah_attr ah_attr;
     memset(&ah_attr, 0, sizeof(ah_attr));
+    
+    // Check if we're using LID-based addressing (InfiniBand) or GID-based (RoCE)
+    if (remote_info.lid == 0) {
+        // RoCE - need GID (not implemented in this basic version)
+        std::cerr << "Warning: LID is 0, this might be RoCE which requires GID setup" << std::endl;
+        std::cerr << "For now, trying with LID=0..." << std::endl;
+    }
+    
     ah_attr.is_global = 0;
     ah_attr.dlid = remote_info.lid;
     ah_attr.sl = 0;
@@ -323,7 +364,11 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
     
     if (ibv_modify_qp(conn.queue_pair, &attr, flags)) {
-        std::cerr << "Failed to modify QP to RTR" << std::endl;
+        std::cerr << "Failed to modify QP to RTR: " << strerror(errno) << std::endl;
+        std::cerr << "  Local LID: " << conn.local_lid << ", Remote LID: " << remote_info.lid << std::endl;
+        std::cerr << "  Remote QP: " << remote_info.qp_num << ", Port: " << (int)conn.port_num << std::endl;
+        std::cerr << "  Path MTU: " << path_mtu << ", Max dest RD atomic: " << (int)max_dest_rd_atomic << std::endl;
+        std::cerr << "  Port state: " << port_attr.state << " (should be " << IBV_PORT_ACTIVE << ")" << std::endl;
         return -1;
     }
     
@@ -334,13 +379,13 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
     attr.sq_psn = 0;
-    attr.max_rd_atomic = 16;
+    attr.max_rd_atomic = max_rd_atomic;
     
     flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
             IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
     
     if (ibv_modify_qp(conn.queue_pair, &attr, flags)) {
-        std::cerr << "Failed to modify QP to RTS" << std::endl;
+        std::cerr << "Failed to modify QP to RTS: " << strerror(errno) << std::endl;
         return -1;
     }
     
