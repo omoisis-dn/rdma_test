@@ -38,6 +38,19 @@ The executable will be created as `rdma_perf_test` in the `build` directory.
 
 ## Usage
 
+### List Available Devices
+
+List all available RDMA devices on the system:
+```bash
+./rdma_perf_test --list-devices
+```
+
+This will display detailed information about each RDMA device including:
+- Device name and GUID
+- Number of physical ports
+- Maximum memory region size, queue pairs, and completion queues
+- Port status, LID, and maximum MTU for each port
+
 ### Server Mode
 
 Run the application as a server:
@@ -54,6 +67,7 @@ Run the application as a client to connect to a server:
 
 ### Options
 
+- `-L, --list-devices`: List available RDMA devices
 - `-s, --server`: Run as server
 - `-c, --client <address>`: Run as client (connect to server)
 - `-d, --device <name>`: RDMA device name (default: first available)
@@ -64,9 +78,12 @@ Run the application as a client to connect to a server:
 - `-b, --bandwidth`: Measure bandwidth
 - `-h, --help`: Show help message
 
-### Example
+### Examples
 
 ```bash
+# List available RDMA devices
+./rdma_perf_test --list-devices
+
 # Terminal 1: Start server
 ./rdma_perf_test --server --port 1
 

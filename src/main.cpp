@@ -3,14 +3,17 @@
 #include <cstring>
 #include "rdma_client.h"
 #include "rdma_server.h"
+#include "rdma_common.h"
 
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
               << "Options:\n"
               << "  -s, --server              Run as server\n"
               << "  -c, --client <address>     Run as client (connect to server)\n"
+              << "  -L, --list-devices         List available RDMA devices\n"
               << "  -d, --device <name>        RDMA device name (default: first available)\n"
-              << "  -p, --port <num>           Port number (default: 1)\n"
+              << "  -p, --port <num>           RDMA port number (default: 1)\n"
+              << "  -t, --tcp-port <num>       TCP port for connection (default: 18515)\n"
               << "  -m, --message-size <size>  Message size in bytes (default: 4096)\n"
               << "  -n, --iterations <num>     Number of iterations (default: 1000)\n"
               << "  -l, --latency             Measure latency\n"
@@ -27,14 +30,18 @@ int main(int argc, char* argv[]) {
     config.measure_bandwidth = false;
     config.device_name = "";
     config.port = 1;
+    config.tcp_port = 18515;  // Default TCP port for connection establishment
 
     bool is_server = false;
     bool is_client = false;
+    bool list_devices = false;
     std::string server_address;
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--server") == 0) {
+        if (strcmp(argv[i], "-L") == 0 || strcmp(argv[i], "--list-devices") == 0) {
+            list_devices = true;
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--server") == 0) {
             is_server = true;
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--client") == 0) {
             is_client = true;
@@ -58,6 +65,14 @@ int main(int argc, char* argv[]) {
                 config.port = std::stoi(argv[++i]);
             } else {
                 std::cerr << "Error: --port requires a port number" << std::endl;
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tcp-port") == 0) {
+            if (i + 1 < argc) {
+                config.tcp_port = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --tcp-port requires a port number" << std::endl;
                 print_usage(argv[0]);
                 return 1;
             }
@@ -89,6 +104,11 @@ int main(int argc, char* argv[]) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    // Handle list devices option
+    if (list_devices) {
+        return list_rdma_devices();
     }
 
     // Default to measuring both if neither is specified

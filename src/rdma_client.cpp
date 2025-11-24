@@ -3,6 +3,11 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
 
 int setup_client_connection(RDMAConnection& conn, const TestConfig& config, const std::string& server_address) {
     // Initialize RDMA device
@@ -40,9 +45,58 @@ int setup_client_connection(RDMAConnection& conn, const TestConfig& config, cons
     }
 
     std::cout << "Client initialized. Connecting to server at " << server_address << std::endl;
-    // In a real implementation, you would exchange QP information via sockets here
-
+    
+    // Connect to server via TCP socket
+    int sockfd = connect_to_server(server_address, config.tcp_port);
+    if (sockfd < 0) {
+        cleanup_rdma_connection(conn);
+        return -1;
+    }
+    
+    // Exchange QP information
+    if (exchange_qp_info_client(sockfd, conn) != 0) {
+        close(sockfd);
+        cleanup_rdma_connection(conn);
+        return -1;
+    }
+    
+    close(sockfd);
     return 0;
+}
+
+int connect_to_server(const std::string& server_address, uint16_t port) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Failed to create socket" << std::endl;
+        return -1;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    
+    // Try to resolve hostname or use as IP address
+    if (inet_pton(AF_INET, server_address.c_str(), &server_addr.sin_addr) <= 0) {
+        // Try hostname resolution
+        struct hostent* he = gethostbyname(server_address.c_str());
+        if (he == nullptr) {
+            std::cerr << "Failed to resolve server address: " << server_address << std::endl;
+            close(sockfd);
+            return -1;
+        }
+        memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
+    }
+    
+    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "Failed to connect to server at " << server_address 
+                  << ":" << port << std::endl;
+        close(sockfd);
+        return -1;
+    }
+    
+    std::cout << "Connected to server at " << server_address << ":" << port << std::endl;
+    return sockfd;
 }
 
 double measure_latency(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations) {

@@ -27,7 +27,14 @@ struct TestConfig {
     bool measure_latency;
     bool measure_bandwidth;
     std::string device_name;
-    uint16_t port;
+    uint16_t port;  // RDMA port number
+    uint16_t tcp_port;  // TCP port for connection establishment
+};
+
+// QP information exchange structure
+struct QPInfo {
+    uint32_t lid;
+    uint32_t qp_num;
 };
 
 // Function declarations
@@ -36,6 +43,10 @@ int create_queue_pair(RDMAConnection& conn);
 int register_memory(RDMAConnection& conn, uint32_t buffer_size);
 void cleanup_rdma_connection(RDMAConnection& conn);
 int poll_completion(RDMAConnection& conn);
+int list_rdma_devices();
+int exchange_qp_info_server(int sockfd, RDMAConnection& conn);
+int exchange_qp_info_client(int sockfd, RDMAConnection& conn);
+int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info);
 
 #endif // RDMA_COMMON_H
 
