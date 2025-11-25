@@ -10,21 +10,15 @@
 #include <cstring>
 
 int setup_server_connection(RDMAConnection& conn, const TestConfig& config) {
-    // Initialize RDMA device
+    // Initialize RDMA device (opens device, queries port/GID)
     if (init_rdma_device(conn, config.device_name, config.port) != 0) {
         return -1;
     }
 
-    // Register memory
+    // Create protection domain and all resources allocated within it
     uint32_t buffer_size = config.message_size * 2; // Extra space for testing
-    if (register_memory(conn, buffer_size) != 0) {
-        cleanup_rdma_connection(conn);
-        return -1;
-    }
-
-    // Create queue pair
-    if (create_queue_pair(conn) != 0) {
-        cleanup_rdma_connection(conn);
+    if (create_protection_domain_resources(conn, buffer_size) != 0) {
+        ibv_close_device(conn.context);
         return -1;
     }
 
@@ -44,8 +38,7 @@ int setup_server_connection(RDMAConnection& conn, const TestConfig& config) {
         return -1;
     }
 
-    std::cout << "Server ready. LID: " << conn.local_lid 
-              << ", QP number: " << conn.queue_pair->qp_num << std::endl;
+    std::cout << "Server ready. QP number: " << conn.queue_pair->qp_num << std::endl;
     std::cout << "Waiting for client connection..." << std::endl;
 
     return 0;
@@ -87,6 +80,39 @@ int create_server_socket(uint16_t port) {
     return sockfd;
 }
 
+int serve_forever(RDMAConnection& conn) {
+    struct ibv_wc wc[NUM_BUFFERS];
+    int num_completions = 0;
+
+    // Post initial receive work requests for all buffers
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (post_receive_work_request(conn, conn.buffer_size, i) != 0) {
+            std::cerr << "Failed to post receive work request" << std::endl;
+            return -1;
+        }
+    }
+    
+    while (true) {
+        num_completions = ibv_poll_cq(conn.completion_queue, NUM_BUFFERS, wc);
+        if (num_completions < 0) {
+            std::cerr << "Poll CQ failed" << std::endl;
+            return -1;
+        }
+        for (int i = 0; i < num_completions; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
+                return -1;
+            }
+            if (wc[i].opcode == IBV_WC_RECV) {
+                if (post_receive_work_request(conn, conn.buffer_size, wc[i].wr_id) != 0) {
+                    std::cerr << "Failed to repost receive work request" << std::endl;
+                    return -1;
+                }
+            }
+        }
+    }
+}
+
 int run_server(const TestConfig& config) {
     RDMAConnection conn = {};
     
@@ -126,13 +152,8 @@ int run_server(const TestConfig& config) {
     close(server_sock);
     
     std::cout << "Server is running. Press Ctrl+C to exit." << std::endl;
-    
-    // Keep server running
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        // Poll for completions
-        poll_completion(conn);
-    }
+
+    serve_forever(conn);
 
     cleanup_rdma_connection(conn);
     return 0;

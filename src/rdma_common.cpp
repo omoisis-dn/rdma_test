@@ -50,35 +50,73 @@ int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint1
         return -1;
     }
 
-    // Allocate protection domain
-    conn.protection_domain = ibv_alloc_pd(conn.context);
-    if (!conn.protection_domain) {
-        std::cerr << "Could not allocate protection domain" << std::endl;
-        ibv_close_device(conn.context);
-        return -1;
-    }
-
     // Query port attributes
     struct ibv_port_attr port_attr;
     if (ibv_query_port(conn.context, port, &port_attr)) {
         std::cerr << "Could not query port " << port << std::endl;
-        ibv_dealloc_pd(conn.protection_domain);
         ibv_close_device(conn.context);
         return -1;
     }
 
-    conn.local_lid = port_attr.lid;
     conn.port_num = port;
-
-    std::cout << "Opened device, LID: " << conn.local_lid << std::endl;
+    conn.gid_index = 1;
+    if (ibv_query_gid(conn.context, port, conn.gid_index, &conn.local_gid)) {
+        std::cerr << "Could not find a valid GID for port " << port << std::endl;
+        ibv_close_device(conn.context);
+        return -1;    
+    }
+    std::cout << "Opened RoCE device, GID index: " << (int)conn.gid_index << ", GID: ";
+    for (int i = 0; i < 16; i++) {
+        printf("%02x", conn.local_gid.raw[i]);
+        if (i == 7) printf(":");
+    }
+    std::cout << std::endl;
+    
+    memset(&conn.remote_gid, 0, sizeof(conn.remote_gid));
+    
     return 0;
 }
 
-int create_queue_pair(RDMAConnection& conn) {
+int allocate_and_register_buffers(RDMAConnection& conn, uint32_t buffer_size) {
+    conn.buffer_size = buffer_size;
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        conn.buffers[i] = aligned_alloc(4096, buffer_size);
+        if (!conn.buffers[i]) {
+            std::cerr << "Could not allocate buffer" << std::endl;
+            return -1;
+        }
+        memset(conn.buffers[i], 0, buffer_size);
+        conn.memory_region[i] =
+            ibv_reg_mr(conn.protection_domain, conn.buffers[i], buffer_size,
+                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                           IBV_ACCESS_REMOTE_WRITE);
+        if (!conn.memory_region[i]) {
+          std::cerr << "Could not register memory region" << std::endl;
+          return -1;
+        }
+    }
+    return 0;
+}
+
+int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size) {
+    // Allocate protection domain
+    conn.protection_domain = ibv_alloc_pd(conn.context);
+    if (!conn.protection_domain) {
+        std::cerr << "Could not allocate protection domain" << std::endl;
+        return -1;
+    }
+
+    if (allocate_and_register_buffers(conn, buffer_size) != 0) {
+        std::cerr << "Could not allocate and register buffers" << std::endl;
+        cleanup_rdma_connection(conn);
+        return -1;
+    };
+
     // Create completion queue
     conn.completion_queue = ibv_create_cq(conn.context, 10, nullptr, nullptr, 0);
     if (!conn.completion_queue) {
         std::cerr << "Could not create completion queue" << std::endl;
+        cleanup_rdma_connection(conn);
         return -1;
     }
 
@@ -99,43 +137,23 @@ int create_queue_pair(RDMAConnection& conn) {
     conn.queue_pair = ibv_create_qp(conn.protection_domain, &qp_init_attr);
     if (!conn.queue_pair) {
         std::cerr << "Could not create queue pair" << std::endl;
-        ibv_destroy_cq(conn.completion_queue);
+        cleanup_rdma_connection(conn);
         return -1;
     }
 
-    return 0;
-}
-
-int register_memory(RDMAConnection& conn, uint32_t buffer_size) {
-    // Allocate buffer
-    conn.buffer = aligned_alloc(4096, buffer_size);
-    if (!conn.buffer) {
-        std::cerr << "Could not allocate buffer" << std::endl;
-        return -1;
-    }
-    memset(conn.buffer, 0, buffer_size);
-    conn.buffer_size = buffer_size;
-
-    // Register memory region
-    conn.memory_region = ibv_reg_mr(conn.protection_domain, conn.buffer, buffer_size,
-                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                                    IBV_ACCESS_REMOTE_WRITE);
-    if (!conn.memory_region) {
-        std::cerr << "Could not register memory region" << std::endl;
-        free(conn.buffer);
-        return -1;
-    }
-
-    std::cout << "Registered memory region: " << buffer_size << " bytes" << std::endl;
+    std::cout << "Created protection domain resources: memory region (" << buffer_size 
+              << " bytes), completion queue, queue pair" << std::endl;
     return 0;
 }
 
 void cleanup_rdma_connection(RDMAConnection& conn) {
-    if (conn.memory_region) {
-        ibv_dereg_mr(conn.memory_region);
-    }
-    if (conn.buffer) {
-        free(conn.buffer);
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (conn.memory_region[i]) {
+            ibv_dereg_mr(conn.memory_region[i]);
+        }
+        if (conn.buffers[i]) {
+            free(conn.buffers[i]);
+        }
     }
     if (conn.queue_pair) {
         ibv_destroy_qp(conn.queue_pair);
@@ -152,16 +170,28 @@ void cleanup_rdma_connection(RDMAConnection& conn) {
 }
 
 int poll_completion(RDMAConnection& conn) {
-    struct ibv_wc wc;
+    struct ibv_wc wc[NUM_BUFFERS];
     int num_completions = 0;
     
-    while (ibv_poll_cq(conn.completion_queue, 1, &wc) > 0) {
-        if (wc.status != IBV_WC_SUCCESS) {
-            std::cerr << "Work completion error: " << ibv_wc_status_str(wc.status) << std::endl;
+    do {
+        num_completions = ibv_poll_cq(conn.completion_queue, NUM_BUFFERS, wc);
+        if (num_completions < 0) {
+            std::cerr << "Poll CQ failed" << std::endl;
             return -1;
         }
-        num_completions++;
-    }
+        for (int i = 0; i < num_completions; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
+                return -1;
+            }
+            if (wc[i].opcode == IBV_WC_RECV) {
+                if (post_receive_work_request(conn, conn.buffer_size, i) != 0) {
+                    std::cerr << "Failed to repost receive work request" << std::endl;
+                    return -1;
+                }
+            }
+        }
+    } while (num_completions > 0);
     
     return num_completions;
 }
@@ -243,8 +273,8 @@ int list_rdma_devices() {
 int exchange_qp_info_server(int sockfd, RDMAConnection& conn) {
     // Send our QP info to client
     QPInfo local_info;
-    local_info.lid = conn.local_lid;
     local_info.qp_num = conn.queue_pair->qp_num;
+    local_info.gid = conn.local_gid;
     
     if (send(sockfd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
         std::cerr << "Failed to send QP info" << std::endl;
@@ -258,15 +288,19 @@ int exchange_qp_info_server(int sockfd, RDMAConnection& conn) {
         return -1;
     }
     
-    conn.remote_lid = remote_info.lid;
+    conn.remote_gid = remote_info.gid;
     
     // Connect QP to RTS
     if (connect_qp_to_rts(conn, remote_info) != 0) {
         return -1;
     }
     
-    std::cout << "QP connected. Remote LID: " << remote_info.lid 
-              << ", Remote QP: " << remote_info.qp_num << std::endl;
+    std::cout << "QP connected. Remote GID: ";
+    for (int i = 0; i < 16; i++) {
+        printf("%02x", remote_info.gid.raw[i]);
+        if (i == 7) printf(":");
+    }
+    std::cout << ", Remote QP: " << remote_info.qp_num << std::endl;
     return 0;
 }
 
@@ -280,23 +314,27 @@ int exchange_qp_info_client(int sockfd, RDMAConnection& conn) {
     
     // Send our QP info to server
     QPInfo local_info;
-    local_info.lid = conn.local_lid;
     local_info.qp_num = conn.queue_pair->qp_num;
+    local_info.gid = conn.local_gid;
     
     if (send(sockfd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
         std::cerr << "Failed to send QP info" << std::endl;
         return -1;
     }
     
-    conn.remote_lid = server_info.lid;
+    conn.remote_gid = server_info.gid;
     
     // Connect QP to RTS
     if (connect_qp_to_rts(conn, server_info) != 0) {
         return -1;
     }
     
-    std::cout << "QP connected. Remote LID: " << server_info.lid 
-              << ", Remote QP: " << server_info.qp_num << std::endl;
+    std::cout << "QP connected. Remote GID: ";
+    for (int i = 0; i < 16; i++) {
+        printf("%02x", server_info.gid.raw[i]);
+        if (i == 7) printf(":");
+    }
+    std::cout << ", Remote QP: " << server_info.qp_num << std::endl;
     return 0;
 }
 
@@ -323,38 +361,34 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     
     // Use the actual port MTU (or a smaller one if 4096 is not supported)
     enum ibv_mtu path_mtu = port_attr.max_mtu;
-    if (path_mtu > IBV_MTU_2048) {
-        path_mtu = IBV_MTU_2048;  // Use 2048 as a safe default
-    }
     
     // Get max atomic capabilities (use minimum of device capabilities)
     // If device doesn't support atomic operations, use 0
     uint8_t max_dest_rd_atomic = (device_attr.max_qp_rd_atom < 16) ? device_attr.max_qp_rd_atom : 16;
     
     uint8_t max_rd_atomic = (device_attr.max_qp_init_rd_atom < 16) ? device_attr.max_qp_init_rd_atom : 16;
-    
+
     // Transition to RTR (Ready to Receive)
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = path_mtu;
     attr.dest_qp_num = remote_info.qp_num;
-    attr.rq_psn = 0;
+    // Use a non-zero PSN for RoCE
+    attr.rq_psn = 1;
     attr.max_dest_rd_atomic = max_dest_rd_atomic;
     attr.min_rnr_timer = 12;
     
+    // Setup address handle for RoCE (GID-based addressing)
     struct ibv_ah_attr ah_attr;
     memset(&ah_attr, 0, sizeof(ah_attr));
-    
-    // Check if we're using LID-based addressing (InfiniBand) or GID-based (RoCE)
-    if (remote_info.lid == 0) {
-        // RoCE - need GID (not implemented in this basic version)
-        std::cerr << "Warning: LID is 0, this might be RoCE which requires GID setup" << std::endl;
-        std::cerr << "For now, trying with LID=0..." << std::endl;
-    }
-    
-    ah_attr.is_global = 0;
-    ah_attr.dlid = remote_info.lid;
+    ah_attr.is_global = 1;
+    ah_attr.grh.hop_limit = 255;
+    ah_attr.grh.dgid = remote_info.gid;
+    ah_attr.grh.sgid_index = conn.gid_index;
+    ah_attr.grh.traffic_class = 0;
+    ah_attr.grh.flow_label = 0;
+    ah_attr.dlid = 0;
     ah_attr.sl = 0;
     ah_attr.src_path_bits = 0;
     ah_attr.port_num = conn.port_num;
@@ -365,8 +399,20 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     
     if (ibv_modify_qp(conn.queue_pair, &attr, flags)) {
         std::cerr << "Failed to modify QP to RTR: " << strerror(errno) << std::endl;
-        std::cerr << "  Local LID: " << conn.local_lid << ", Remote LID: " << remote_info.lid << std::endl;
+        std::cerr << "  Local GID: ";
+        for (int i = 0; i < 16; i++) {
+            printf("%02x", conn.local_gid.raw[i]);
+            if (i == 7) printf(":");
+        }
+        std::cerr << std::endl;
+        std::cerr << "  Remote GID: ";
+        for (int i = 0; i < 16; i++) {
+            printf("%02x", remote_info.gid.raw[i]);
+            if (i == 7) printf(":");
+        }
+        std::cerr << std::endl;
         std::cerr << "  Remote QP: " << remote_info.qp_num << ", Port: " << (int)conn.port_num << std::endl;
+        std::cerr << "  GID index: " << (int)conn.gid_index << std::endl;
         std::cerr << "  Path MTU: " << path_mtu << ", Max dest RD atomic: " << (int)max_dest_rd_atomic << std::endl;
         std::cerr << "  Port state: " << port_attr.state << " (should be " << IBV_PORT_ACTIVE << ")" << std::endl;
         return -1;
@@ -378,7 +424,8 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     attr.timeout = 14;
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
-    attr.sq_psn = 0;
+    // Use a non-zero PSN for RoCE (must match rq_psn)
+    attr.sq_psn = 1;
     attr.max_rd_atomic = max_rd_atomic;
     
     flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
@@ -386,6 +433,28 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     
     if (ibv_modify_qp(conn.queue_pair, &attr, flags)) {
         std::cerr << "Failed to modify QP to RTS: " << strerror(errno) << std::endl;
+        return -1;
+    }
+    
+    return 0;
+}
+
+int post_receive_work_request(RDMAConnection& conn, uint32_t size, int buffer_index) {
+    struct ibv_sge sge;
+    sge.addr = (uintptr_t)conn.buffers[buffer_index];
+    sge.length = size;
+    sge.lkey = conn.memory_region[buffer_index]->lkey;
+
+    struct ibv_recv_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.wr_id = buffer_index;
+    wr.next = nullptr;
+
+    struct ibv_recv_wr* bad_wr;
+    if (ibv_post_recv(conn.queue_pair, &wr, &bad_wr)) {
+        std::cerr << "Failed to post receive work request" << std::endl;
         return -1;
     }
     

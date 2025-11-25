@@ -1,5 +1,6 @@
 #include "rdma_client.h"
 #include "rdma_common.h"
+#include <cstdint>
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -10,21 +11,15 @@
 #include <netdb.h>
 
 int setup_client_connection(RDMAConnection& conn, const TestConfig& config, const std::string& server_address) {
-    // Initialize RDMA device
+    // Initialize RDMA device (opens device, queries port/GID)
     if (init_rdma_device(conn, config.device_name, config.port) != 0) {
         return -1;
     }
 
-    // Register memory
+    // Create protection domain and all resources allocated within it
     uint32_t buffer_size = config.message_size * 2;
-    if (register_memory(conn, buffer_size) != 0) {
-        cleanup_rdma_connection(conn);
-        return -1;
-    }
-
-    // Create queue pair
-    if (create_queue_pair(conn) != 0) {
-        cleanup_rdma_connection(conn);
+    if (create_protection_domain_resources(conn, buffer_size) != 0) {
+        ibv_close_device(conn.context);
         return -1;
     }
 
@@ -108,9 +103,9 @@ double measure_latency(RDMAConnection& conn, uint32_t message_size, uint32_t num
     for (uint32_t i = 0; i < num_iterations; i++) {
         // Post send work request
         struct ibv_sge sge;
-        sge.addr = (uintptr_t)conn.buffer;
+        sge.addr = (uintptr_t)conn.buffers[0];
         sge.length = message_size;
-        sge.lkey = conn.memory_region->lkey;
+        sge.lkey = conn.memory_region[0]->lkey;
 
         struct ibv_send_wr wr;
         memset(&wr, 0, sizeof(wr));
@@ -149,53 +144,78 @@ double measure_latency(RDMAConnection& conn, uint32_t message_size, uint32_t num
     return avg_latency_us;
 }
 
-double measure_bandwidth(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations) {
+int post_send_work_request(RDMAConnection& conn, uint32_t message_size, int buffer_index) {
+    struct ibv_sge sge;
+    sge.addr = (uintptr_t)conn.buffers[buffer_index];
+    sge.length = message_size;
+    sge.lkey = conn.memory_region[buffer_index]->lkey;
+
+    struct ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr_id = buffer_index;
+    wr.next = nullptr;
+
+    struct ibv_send_wr* bad_wr;
+    if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
+        std::cerr << "Failed to post send" << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
+
+double measure_bandwidth(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations, int num_messages) {
     std::cout << "Measuring bandwidth with message size: " << message_size 
               << " bytes, iterations: " << num_iterations << std::endl;
 
     auto start = std::chrono::high_resolution_clock::now();
     
     for (uint32_t i = 0; i < num_iterations; i++) {
+        int sent_count = 0;
         // Post send work request
-        struct ibv_sge sge;
-        sge.addr = (uintptr_t)conn.buffer;
-        sge.length = message_size;
-        sge.lkey = conn.memory_region->lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
-
-        struct ibv_send_wr* bad_wr;
-        if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
-            std::cerr << "Failed to post send" << std::endl;
-            return -1.0;
+        for (int j = 0; j < std::min(num_messages, NUM_BUFFERS); j++) {
+            if (post_send_work_request(conn, message_size, j) != 0) {
+                std::cerr << "Failed to post send" << std::endl;
+                return -1.0;
+            }
+            sent_count++;
         }
 
-        // Wait for completion
-        struct ibv_wc wc;
-        int num_completions = 0;
-        while (num_completions == 0) {
-            num_completions = ibv_poll_cq(conn.completion_queue, 1, &wc);
+        struct ibv_wc wc[NUM_BUFFERS];
+        int total_completions = 0;
+        while (total_completions < num_messages) {
+            // Wait for completion
+            int num_completions = 0;
+            num_completions = ibv_poll_cq(conn.completion_queue, NUM_BUFFERS, wc);
             if (num_completions < 0) {
                 std::cerr << "Poll CQ failed" << std::endl;
                 return -1.0;
             }
-        }
-
-        if (wc.status != IBV_WC_SUCCESS) {
-            std::cerr << "Work completion error: " << ibv_wc_status_str(wc.status) << std::endl;
-            return -1.0;
+            for (int k = 0; k < num_completions; k++) {
+                if (wc[k].status != IBV_WC_SUCCESS) {
+                    std::cerr << "Work completion error: " << ibv_wc_status_str(wc[k].status) << std::endl;
+                    return -1.0;
+                }
+                ++total_completions;
+                if (sent_count < num_messages) {
+                    if (post_send_work_request(conn, message_size, wc[k].wr_id) != 0) {
+                        std::cerr << "Failed to post send" << std::endl;
+                        return -1.0;
+                    }
+                    ++sent_count;
+                }
+            }
         }
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
     
-    double total_bytes = (double)message_size * num_iterations;
+    double total_bytes = (double)message_size * num_iterations * num_messages;
     double duration_seconds = duration / 1e9;
     double bandwidth_gbps = (total_bytes * 8) / (duration_seconds * 1e9);
     
@@ -218,7 +238,7 @@ int run_client(const TestConfig& config, const std::string& server_address) {
     }
 
     if (config.measure_bandwidth) {
-        double bandwidth = measure_bandwidth(conn, config.message_size, config.num_iterations);
+        double bandwidth = measure_bandwidth(conn, config.message_size, config.num_iterations, config.num_messages);
         if (bandwidth > 0) {
             std::cout << "Bandwidth: " << bandwidth << " Gbps" << std::endl;
         }

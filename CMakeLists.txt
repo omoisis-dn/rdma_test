@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(RDMAPerfTest VERSION 1.0.0 LANGUAGES CXX)
 
+# Export compile commands for clangd and other language servers
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

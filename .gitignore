@@ -18,6 +18,7 @@ rdma_perf_test
 *.swp
 *.swo
 *~
+.cache
 
 # OS files
 .DS_Store
