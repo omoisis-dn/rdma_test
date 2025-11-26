@@ -1,44 +1,30 @@
 #include "rdma_server.h"
 #include "rdma_common.h"
 #include <iostream>
-#include <chrono>
-#include <thread>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <sys/select.h>
+#include <errno.h>
 
 int setup_server_connection(RDMAConnection& conn, const TestConfig& config) {
     // Initialize RDMA device (opens device, queries port/GID)
+    // Note: We don't create buffers yet - that happens after receiving test params from client
     if (init_rdma_device(conn, config.device_name, config.port) != 0) {
         return -1;
     }
 
-    // Create protection domain and all resources allocated within it
-    if (create_protection_domain_resources(conn, config.message_size, config.num_in_flight) != 0) {
+    // Allocate protection domain (needed before creating QP, but buffers will be allocated later)
+    conn.protection_domain = ibv_alloc_pd(conn.context);
+    if (!conn.protection_domain) {
+        std::cerr << "Could not allocate protection domain" << std::endl;
         ibv_close_device(conn.context);
         return -1;
     }
 
-    // Transition QP to INIT
-    struct ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_INIT;
-    attr.port_num = conn.port_num;
-    attr.pkey_index = 0;
-    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE;
-
-    if (ibv_modify_qp(conn.queue_pair, &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-        std::cerr << "Failed to modify QP to INIT" << std::endl;
-        cleanup_rdma_connection(conn);
-        return -1;
-    }
-
-    std::cout << "Server ready. QP number: " << conn.queue_pair->qp_num << std::endl;
-    std::cout << "Waiting for client connection..." << std::endl;
+    std::cout << "Server RDMA device initialized. Waiting for client connection..." << std::endl;
 
     return 0;
 }
@@ -79,7 +65,7 @@ int create_server_socket(uint16_t port) {
     return sockfd;
 }
 
-int serve_forever(RDMAConnection& conn) {
+int serve_test(RDMAConnection& conn, int client_sock) {
     // Post initial receive work requests for all in-flight slots
     for (uint32_t i = 0; i < conn.num_in_flight; i++) {
         if (post_receive_work_request(conn, i) != 0) {
@@ -89,11 +75,45 @@ int serve_forever(RDMAConnection& conn) {
     }
     
     std::cout << "Posted " << conn.num_in_flight << " initial receive work requests" << std::endl;
+    std::cout << "Test started. Waiting for completion signal..." << std::endl;
     
-    // Keep polling for receive completions (automatically reposts receives)
+    // Keep polling for receive completions until client signals test is done
+    // Client will send a single byte (0) when test is complete
+    char test_done = 0;
+    fd_set readfds;
+    struct timeval timeout;
+    
     while (true) {
+        // Check if client sent test completion signal
+        FD_ZERO(&readfds);
+        FD_SET(client_sock, &readfds);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 1000;  // 1ms timeout
+        
+        int select_result = select(client_sock + 1, &readfds, nullptr, nullptr, &timeout);
+        if (select_result > 0 && FD_ISSET(client_sock, &readfds)) {
+            // Client sent something - check if it's the test completion signal
+            ssize_t bytes = recv(client_sock, &test_done, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (bytes > 0) {
+                // Client closed connection or sent completion signal
+                recv(client_sock, &test_done, 1, 0);
+                std::cout << "Test completed by client" << std::endl;
+                break;
+            } else if (bytes == 0) {
+                // Client closed connection
+                std::cout << "Client disconnected" << std::endl;
+                break;
+            }
+        } else if (select_result < 0 && errno != EINTR) {
+            std::cerr << "Select error: " << strerror(errno) << std::endl;
+            return -1;
+        }
+        
+        // Poll for RDMA completions
         poll_receive_completions(conn);
     }
+    
+    return 0;
 }
 
 int run_server(const TestConfig& config) {
@@ -110,34 +130,44 @@ int run_server(const TestConfig& config) {
         return -1;
     }
     
-    // Accept client connection
-    struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
-    if (client_sock < 0) {
-        std::cerr << "Failed to accept client connection" << std::endl;
-        close(server_sock);
-        cleanup_rdma_connection(conn);
-        return -1;
-    }
+    std::cout << "Server ready. Waiting for clients (Press Ctrl+C to exit)..." << std::endl;
     
-    std::cout << "Client connected from " << inet_ntoa(client_addr.sin_addr) << std::endl;
-    
-    // Exchange QP information
-    if (exchange_qp_info_server(client_sock, conn) != 0) {
+    // Loop to handle multiple sequential tests
+    while (true) {
+        // Accept client connection
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
+        if (client_sock < 0) {
+            std::cerr << "Failed to accept client connection" << std::endl;
+            break;
+        }
+        
+        std::cout << "\n=== New client connected from " << inet_ntoa(client_addr.sin_addr) << " ===" << std::endl;
+        
+        // Exchange test parameters and QP information
+        TestParams test_params;
+        if (exchange_test_params_and_qp_info_server(client_sock, conn, test_params) != 0) {
+            std::cerr << "Failed to exchange test parameters and QP info" << std::endl;
+            close(client_sock);
+            continue;  // Continue to next client
+        }
+        
+        // Serve the test (keep socket open to detect completion)
+        if (serve_test(conn, client_sock) != 0) {
+            std::cerr << "Error during test execution" << std::endl;
+        }
+        
         close(client_sock);
-        close(server_sock);
-        cleanup_rdma_connection(conn);
-        return -1;
+        
+        // Cleanup test-specific resources (buffer, MR, CQ, QP) but keep device and PD
+        std::cout << "Cleaning up test resources..." << std::endl;
+        cleanup_rdma_test_resources(conn);
+        
+        std::cout << "Ready for next client..." << std::endl;
     }
     
-    close(client_sock);
     close(server_sock);
-    
-    std::cout << "Server is running. Press Ctrl+C to exit." << std::endl;
-
-    serve_forever(conn);
-
     cleanup_rdma_connection(conn);
     return 0;
 }

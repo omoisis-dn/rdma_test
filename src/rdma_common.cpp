@@ -77,10 +77,8 @@ int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint1
     return 0;
 }
 
-int allocate_and_register_buffer(RDMAConnection& conn, uint32_t message_size, uint32_t num_in_flight) {
-    conn.message_size = message_size;
-    conn.num_in_flight = num_in_flight;
-    conn.buffer_size = message_size * num_in_flight;
+int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size) {
+    conn.buffer_size = buffer_size;
     
     // Allocate a single large buffer aligned to page size
     conn.buffer = aligned_alloc(4096, conn.buffer_size);
@@ -103,17 +101,14 @@ int allocate_and_register_buffer(RDMAConnection& conn, uint32_t message_size, ui
     return 0;
 }
 
-int create_protection_domain_resources(RDMAConnection& conn, uint32_t message_size, uint32_t num_in_flight) {
-    // Allocate protection domain
-    conn.protection_domain = ibv_alloc_pd(conn.context);
-    if (!conn.protection_domain) {
-        std::cerr << "Could not allocate protection domain" << std::endl;
-        return -1;
-    }
-
-    if (allocate_and_register_buffer(conn, message_size, num_in_flight) != 0) {
+int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight) {
+    // Note: Protection domain should already be allocated before calling this function
+    
+    conn.chunk_size = chunk_size;
+    conn.num_in_flight = num_in_flight;
+    
+    if (allocate_and_register_buffer(conn, buffer_size) != 0) {
         std::cerr << "Could not allocate and register buffer" << std::endl;
-        cleanup_rdma_connection(conn);
         return -1;
     }
 
@@ -122,7 +117,6 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t message_si
     conn.completion_queue = ibv_create_cq(conn.context, num_in_flight, nullptr, nullptr, 0);
     if (!conn.completion_queue) {
         std::cerr << "Could not create completion queue" << std::endl;
-        cleanup_rdma_connection(conn);
         return -1;
     }
 
@@ -143,34 +137,46 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t message_si
     conn.queue_pair = ibv_create_qp(conn.protection_domain, &qp_init_attr);
     if (!conn.queue_pair) {
         std::cerr << "Could not create queue pair" << std::endl;
-        cleanup_rdma_connection(conn);
         return -1;
     }
 
     std::cout << "Created protection domain resources: memory region (" << conn.buffer_size 
-              << " bytes total, " << num_in_flight << " slots of " << message_size 
-              << " bytes), completion queue, queue pair" << std::endl;
+              << " bytes total), chunk size: " << chunk_size 
+              << " bytes, in-flight: " << num_in_flight 
+              << ", completion queue, queue pair" << std::endl;
     return 0;
 }
 
-void cleanup_rdma_connection(RDMAConnection& conn) {
+void cleanup_rdma_test_resources(RDMAConnection& conn) {
+    // Cleanup only test-specific resources (buffer, MR, CQ, QP)
+    // Keep device and protection domain for reuse
     if (conn.memory_region) {
         ibv_dereg_mr(conn.memory_region);
+        conn.memory_region = nullptr;
     }
     if (conn.buffer) {
         free(conn.buffer);
+        conn.buffer = nullptr;
     }
     if (conn.queue_pair) {
         ibv_destroy_qp(conn.queue_pair);
+        conn.queue_pair = nullptr;
     }
     if (conn.completion_queue) {
         ibv_destroy_cq(conn.completion_queue);
+        conn.completion_queue = nullptr;
     }
+}
+
+void cleanup_rdma_connection(RDMAConnection& conn) {
+    cleanup_rdma_test_resources(conn);
     if (conn.protection_domain) {
         ibv_dealloc_pd(conn.protection_domain);
+        conn.protection_domain = nullptr;
     }
     if (conn.context) {
         ibv_close_device(conn.context);
+        conn.context = nullptr;
     }
 }
 
@@ -295,8 +301,52 @@ int list_rdma_devices() {
     return 0;
 }
 
-int exchange_qp_info_server(int sockfd, RDMAConnection& conn) {
-    // Send our QP info to client
+int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, TestParams& test_params) {
+    // Step 1: Receive test parameters from client
+    TestParams client_params;
+    if (recv(sockfd, &client_params, sizeof(client_params), 0) != sizeof(client_params)) {
+        std::cerr << "Failed to receive test parameters from client" << std::endl;
+        return -1;
+    }
+    
+    std::cout << "Received test parameters from client: buffer_size=" << client_params.buffer_size
+              << ", chunk_size=" << client_params.chunk_size
+              << ", num_in_flight=" << client_params.num_in_flight << std::endl;
+    
+    // Validate that buffer_size is divisible by chunk_size
+    if (client_params.buffer_size % client_params.chunk_size != 0) {
+        std::cerr << "Error: buffer_size (" << client_params.buffer_size 
+                  << ") must be divisible by chunk_size (" << client_params.chunk_size << ")" << std::endl;
+        return -1;
+    }
+    
+    // Use client's parameters (they must match)
+    test_params = client_params;
+    
+    // Step 2: Now initialize buffers with the received parameters
+    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight) != 0) {
+        std::cerr << "Failed to create protection domain resources" << std::endl;
+        return -1;
+    }
+    
+    // Step 3: Transition QP to INIT
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_INIT;
+    attr.port_num = conn.port_num;
+    attr.pkey_index = 0;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                           IBV_ACCESS_REMOTE_WRITE;
+    
+    if (ibv_modify_qp(conn.queue_pair, &attr,
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+        std::cerr << "Failed to modify QP to INIT" << std::endl;
+        return -1;
+    }
+    
+    std::cout << "Server QP initialized. QP number: " << conn.queue_pair->qp_num << std::endl;
+    
+    // Step 4: Send our QP info to client
     QPInfo local_info;
     local_info.qp_num = conn.queue_pair->qp_num;
     local_info.gid = conn.local_gid;
@@ -306,7 +356,7 @@ int exchange_qp_info_server(int sockfd, RDMAConnection& conn) {
         return -1;
     }
     
-    // Receive client's QP info
+    // Step 5: Receive client's QP info
     QPInfo remote_info;
     if (recv(sockfd, &remote_info, sizeof(remote_info), 0) != sizeof(remote_info)) {
         std::cerr << "Failed to receive QP info" << std::endl;
@@ -315,7 +365,7 @@ int exchange_qp_info_server(int sockfd, RDMAConnection& conn) {
     
     conn.remote_gid = remote_info.gid;
     
-    // Connect QP to RTS
+    // Step 6: Connect QP to RTS
     if (connect_qp_to_rts(conn, remote_info) != 0) {
         return -1;
     }
@@ -329,15 +379,48 @@ int exchange_qp_info_server(int sockfd, RDMAConnection& conn) {
     return 0;
 }
 
-int exchange_qp_info_client(int sockfd, RDMAConnection& conn) {
-    // Receive server's QP info
+int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, const TestParams& test_params) {
+    // Step 1: Send test parameters to server
+    if (send(sockfd, &test_params, sizeof(test_params), 0) != sizeof(test_params)) {
+        std::cerr << "Failed to send test parameters to server" << std::endl;
+        return -1;
+    }
+    
+    std::cout << "Sent test parameters to server: buffer_size=" << test_params.buffer_size
+              << ", chunk_size=" << test_params.chunk_size
+              << ", num_in_flight=" << test_params.num_in_flight << std::endl;
+    
+    // Step 2: Now initialize buffers with the same parameters
+    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight) != 0) {
+        std::cerr << "Failed to create protection domain resources" << std::endl;
+        return -1;
+    }
+    
+    // Step 3: Transition QP to INIT
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_INIT;
+    attr.port_num = conn.port_num;
+    attr.pkey_index = 0;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                           IBV_ACCESS_REMOTE_WRITE;
+    
+    if (ibv_modify_qp(conn.queue_pair, &attr,
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+        std::cerr << "Failed to modify QP to INIT" << std::endl;
+        return -1;
+    }
+    
+    std::cout << "Client QP initialized. QP number: " << conn.queue_pair->qp_num << std::endl;
+    
+    // Step 4: Receive server's QP info
     QPInfo server_info;
     if (recv(sockfd, &server_info, sizeof(server_info), 0) != sizeof(server_info)) {
         std::cerr << "Failed to receive server QP info" << std::endl;
         return -1;
     }
     
-    // Send our QP info to server
+    // Step 5: Send our QP info to server
     QPInfo local_info;
     local_info.qp_num = conn.queue_pair->qp_num;
     local_info.gid = conn.local_gid;
@@ -349,7 +432,7 @@ int exchange_qp_info_client(int sockfd, RDMAConnection& conn) {
     
     conn.remote_gid = server_info.gid;
     
-    // Connect QP to RTS
+    // Step 6: Connect QP to RTS
     if (connect_qp_to_rts(conn, server_info) != 0) {
         return -1;
     }
@@ -471,8 +554,8 @@ int post_receive_work_request(RDMAConnection& conn, uint32_t slot_index) {
     }
     
     struct ibv_sge sge;
-    sge.addr = (uintptr_t)conn.buffer + (slot_index * conn.message_size);
-    sge.length = conn.message_size;
+    sge.addr = (uintptr_t)conn.buffer + (slot_index * conn.chunk_size);
+    sge.length = conn.chunk_size;
     sge.lkey = conn.memory_region->lkey;
 
     struct ibv_recv_wr wr;
@@ -491,15 +574,18 @@ int post_receive_work_request(RDMAConnection& conn, uint32_t slot_index) {
     return 0;
 }
 
-int post_send_work_request(RDMAConnection& conn, uint32_t slot_index) {
-    if (slot_index >= conn.num_in_flight) {
-        std::cerr << "Invalid slot index: " << slot_index << std::endl;
+int post_send_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_size) {
+    // Validate chunk offset and size
+    if (chunk_offset + chunk_size > conn.buffer_size) {
+        std::cerr << "Invalid chunk: offset " << chunk_offset 
+                  << " + size " << chunk_size 
+                  << " exceeds buffer size " << conn.buffer_size << std::endl;
         return -1;
     }
     
     struct ibv_sge sge;
-    sge.addr = (uintptr_t)conn.buffer + (slot_index * conn.message_size);
-    sge.length = conn.message_size;
+    sge.addr = (uintptr_t)conn.buffer + chunk_offset;
+    sge.length = chunk_size;
     sge.lkey = conn.memory_region->lkey;
 
     struct ibv_send_wr wr;
@@ -508,7 +594,7 @@ int post_send_work_request(RDMAConnection& conn, uint32_t slot_index) {
     wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr_id = slot_index;  // Store slot index for tracking
+    wr.wr_id = chunk_offset;  // Store chunk offset for tracking
     wr.next = nullptr;
 
     struct ibv_send_wr* bad_wr;

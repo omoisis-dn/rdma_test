@@ -5,7 +5,7 @@
 #include <string>
 
 int run_client(const TestConfig& config, const std::string& server_address);
-int setup_client_connection(RDMAConnection& conn, const TestConfig& config, const std::string& server_address);
+int setup_client_connection(RDMAConnection& conn, const TestConfig& config, const std::string& server_address, int& sockfd);
 int connect_to_server(const std::string& server_address, uint16_t port);
 double measure_latency(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations);
 double measure_bandwidth(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations);

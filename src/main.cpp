@@ -14,7 +14,8 @@ void print_usage(const char* program_name) {
               << "  -d, --device <name>        RDMA device name (default: first available)\n"
               << "  -p, --port <num>           RDMA port number (default: 1)\n"
               << "  -t, --tcp-port <num>       TCP port for connection (default: 18515)\n"
-              << "  -m, --message-size <size>  Message size in bytes (default: 4096)\n"
+              << "  -B, --buffer-size <size>  Buffer size in bytes (default: 4096)\n"
+              << "  -m, --chunk-size <size>   Chunk size in bytes (default: 4096)\n"
               << "  -n, --iterations <num>     Number of iterations (default: 1000)\n"
               << "  -f, --in-flight <num>      Number of parallel in-flight operations (default: 1)\n"
               << "  -l, --latency             Measure latency\n"
@@ -25,7 +26,8 @@ void print_usage(const char* program_name) {
 
 int main(int argc, char* argv[]) {
     TestConfig config = {};
-    config.message_size = 4096;
+    config.buffer_size = 4096;
+    config.chunk_size = 4096;
     config.num_iterations = 1000;
     config.num_in_flight = 1;
     config.measure_latency = false;
@@ -78,11 +80,20 @@ int main(int argc, char* argv[]) {
                 print_usage(argv[0]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--message-size") == 0) {
+        } else if (strcmp(argv[i], "-B") == 0 || strcmp(argv[i], "--buffer-size") == 0) {
             if (i + 1 < argc) {
-                config.message_size = std::stoul(argv[++i]);
+                config.buffer_size = std::stoul(argv[++i]);
             } else {
-                std::cerr << "Error: --message-size requires a size" << std::endl;
+                std::cerr << "Error: --buffer-size requires a size" << std::endl;
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--chunk-size") == 0 || 
+                   strcmp(argv[i], "--message-size") == 0) {  // Keep --message-size for backward compatibility
+            if (i + 1 < argc) {
+                config.chunk_size = std::stoul(argv[++i]);
+            } else {
+                std::cerr << "Error: --chunk-size requires a size" << std::endl;
                 print_usage(argv[0]);
                 return 1;
             }
