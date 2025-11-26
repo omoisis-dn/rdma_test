@@ -17,8 +17,7 @@ int setup_client_connection(RDMAConnection& conn, const TestConfig& config, cons
     }
 
     // Create protection domain and all resources allocated within it
-    uint32_t buffer_size = config.message_size * 2;
-    if (create_protection_domain_resources(conn, buffer_size) != 0) {
+    if (create_protection_domain_resources(conn, config.message_size, config.num_in_flight) != 0) {
         ibv_close_device(conn.context);
         return -1;
     }
@@ -101,39 +100,19 @@ double measure_latency(RDMAConnection& conn, uint32_t message_size, uint32_t num
     auto start = std::chrono::high_resolution_clock::now();
     
     for (uint32_t i = 0; i < num_iterations; i++) {
-        // Post send work request
-        struct ibv_sge sge;
-        sge.addr = (uintptr_t)conn.buffers[0];
-        sge.length = message_size;
-        sge.lkey = conn.memory_region[0]->lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
-
-        struct ibv_send_wr* bad_wr;
-        if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
+        // Use slot 0 for latency measurement (single message at a time)
+        if (post_send_work_request(conn, 0) != 0) {
             std::cerr << "Failed to post send" << std::endl;
             return -1.0;
         }
 
-        // Wait for completion
-        struct ibv_wc wc;
+        // Wait for send completion
         int num_completions = 0;
         while (num_completions == 0) {
-            num_completions = ibv_poll_cq(conn.completion_queue, 1, &wc);
+            num_completions = poll_send_completions(conn, 1);
             if (num_completions < 0) {
-                std::cerr << "Poll CQ failed" << std::endl;
                 return -1.0;
             }
-        }
-
-        if (wc.status != IBV_WC_SUCCESS) {
-            std::cerr << "Work completion error: " << ibv_wc_status_str(wc.status) << std::endl;
-            return -1.0;
         }
     }
 
@@ -144,78 +123,42 @@ double measure_latency(RDMAConnection& conn, uint32_t message_size, uint32_t num
     return avg_latency_us;
 }
 
-int post_send_work_request(RDMAConnection& conn, uint32_t message_size, int buffer_index) {
-    struct ibv_sge sge;
-    sge.addr = (uintptr_t)conn.buffers[buffer_index];
-    sge.length = message_size;
-    sge.lkey = conn.memory_region[buffer_index]->lkey;
 
-    struct ibv_send_wr wr;
-    memset(&wr, 0, sizeof(wr));
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr_id = buffer_index;
-    wr.next = nullptr;
-
-    struct ibv_send_wr* bad_wr;
-    if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
-        std::cerr << "Failed to post send" << std::endl;
-        return -1;
-    }
-
-    return 0;
-}
-
-double measure_bandwidth(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations, int num_messages) {
+double measure_bandwidth(RDMAConnection& conn, uint32_t message_size, uint32_t num_iterations) {
     std::cout << "Measuring bandwidth with message size: " << message_size 
-              << " bytes, iterations: " << num_iterations << std::endl;
+              << " bytes, iterations: " << num_iterations 
+              << ", in-flight: " << conn.num_in_flight << std::endl;
 
     auto start = std::chrono::high_resolution_clock::now();
     
-    for (uint32_t i = 0; i < num_iterations; i++) {
-        int sent_count = 0;
-        // Post send work request
-        for (int j = 0; j < std::min(num_messages, NUM_BUFFERS); j++) {
-            if (post_send_work_request(conn, message_size, j) != 0) {
+    uint32_t messages_sent = 0;
+    uint32_t messages_completed = 0;
+    
+    // Keep sending messages until we've completed all iterations
+    while (messages_completed < num_iterations) {
+        // Post as many sends as we can (up to num_in_flight)
+        while (messages_sent < num_iterations && 
+               (messages_sent - messages_completed) < conn.num_in_flight) {
+            uint32_t slot = messages_sent % conn.num_in_flight;
+            if (post_send_work_request(conn, slot) != 0) {
                 std::cerr << "Failed to post send" << std::endl;
                 return -1.0;
             }
-            sent_count++;
+            messages_sent++;
         }
-
-        struct ibv_wc wc[NUM_BUFFERS];
-        int total_completions = 0;
-        while (total_completions < num_messages) {
-            // Wait for completion
-            int num_completions = 0;
-            num_completions = ibv_poll_cq(conn.completion_queue, NUM_BUFFERS, wc);
-            if (num_completions < 0) {
-                std::cerr << "Poll CQ failed" << std::endl;
-                return -1.0;
-            }
-            for (int k = 0; k < num_completions; k++) {
-                if (wc[k].status != IBV_WC_SUCCESS) {
-                    std::cerr << "Work completion error: " << ibv_wc_status_str(wc[k].status) << std::endl;
-                    return -1.0;
-                }
-                ++total_completions;
-                if (sent_count < num_messages) {
-                    if (post_send_work_request(conn, message_size, wc[k].wr_id) != 0) {
-                        std::cerr << "Failed to post send" << std::endl;
-                        return -1.0;
-                    }
-                    ++sent_count;
-                }
-            }
+        
+        // Poll for send completions (all completions are sends)
+        int num_completions = poll_send_completions(conn, num_iterations - messages_completed);
+        if (num_completions < 0) {
+            return -1.0;
         }
+        messages_completed += num_completions;
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
     
-    double total_bytes = (double)message_size * num_iterations * num_messages;
+    double total_bytes = (double)message_size * num_iterations;
     double duration_seconds = duration / 1e9;
     double bandwidth_gbps = (total_bytes * 8) / (duration_seconds * 1e9);
     
@@ -238,7 +181,7 @@ int run_client(const TestConfig& config, const std::string& server_address) {
     }
 
     if (config.measure_bandwidth) {
-        double bandwidth = measure_bandwidth(conn, config.message_size, config.num_iterations, config.num_messages);
+        double bandwidth = measure_bandwidth(conn, config.message_size, config.num_iterations);
         if (bandwidth > 0) {
             std::cout << "Bandwidth: " << bandwidth << " Gbps" << std::endl;
         }

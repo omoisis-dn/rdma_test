@@ -16,7 +16,7 @@ void print_usage(const char* program_name) {
               << "  -t, --tcp-port <num>       TCP port for connection (default: 18515)\n"
               << "  -m, --message-size <size>  Message size in bytes (default: 4096)\n"
               << "  -n, --iterations <num>     Number of iterations (default: 1000)\n"
-              << "  -k, --num-messages <num>   Number of messages (default: 1)\n"
+              << "  -f, --in-flight <num>      Number of parallel in-flight operations (default: 1)\n"
               << "  -l, --latency             Measure latency\n"
               << "  -b, --bandwidth           Measure bandwidth\n"
               << "  -h, --help                Show this help message\n"
@@ -27,12 +27,12 @@ int main(int argc, char* argv[]) {
     TestConfig config = {};
     config.message_size = 4096;
     config.num_iterations = 1000;
+    config.num_in_flight = 1;
     config.measure_latency = false;
     config.measure_bandwidth = false;
     config.device_name = "";
     config.port = 1;
     config.tcp_port = 18515;  // Default TCP port for connection establishment
-    config.num_messages = 1;
     
     bool is_server = false;
     bool is_client = false;
@@ -94,11 +94,11 @@ int main(int argc, char* argv[]) {
                 print_usage(argv[0]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--num-messages") == 0) {
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--in-flight") == 0) {
             if (i + 1 < argc) {
-                config.num_messages = std::stoul(argv[++i]);
+                config.num_in_flight = std::stoul(argv[++i]);
             } else {
-                std::cerr << "Error: --num-messages requires a number" << std::endl;
+                std::cerr << "Error: --in-flight requires a number" << std::endl;
                 print_usage(argv[0]);
                 return 1;
             }

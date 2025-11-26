@@ -16,8 +16,7 @@ int setup_server_connection(RDMAConnection& conn, const TestConfig& config) {
     }
 
     // Create protection domain and all resources allocated within it
-    uint32_t buffer_size = config.message_size * 2; // Extra space for testing
-    if (create_protection_domain_resources(conn, buffer_size) != 0) {
+    if (create_protection_domain_resources(conn, config.message_size, config.num_in_flight) != 0) {
         ibv_close_device(conn.context);
         return -1;
     }
@@ -81,35 +80,19 @@ int create_server_socket(uint16_t port) {
 }
 
 int serve_forever(RDMAConnection& conn) {
-    struct ibv_wc wc[NUM_BUFFERS];
-    int num_completions = 0;
-
-    // Post initial receive work requests for all buffers
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        if (post_receive_work_request(conn, conn.buffer_size, i) != 0) {
-            std::cerr << "Failed to post receive work request" << std::endl;
+    // Post initial receive work requests for all in-flight slots
+    for (uint32_t i = 0; i < conn.num_in_flight; i++) {
+        if (post_receive_work_request(conn, i) != 0) {
+            std::cerr << "Failed to post initial receive work request for slot " << i << std::endl;
             return -1;
         }
     }
     
+    std::cout << "Posted " << conn.num_in_flight << " initial receive work requests" << std::endl;
+    
+    // Keep polling for receive completions (automatically reposts receives)
     while (true) {
-        num_completions = ibv_poll_cq(conn.completion_queue, NUM_BUFFERS, wc);
-        if (num_completions < 0) {
-            std::cerr << "Poll CQ failed" << std::endl;
-            return -1;
-        }
-        for (int i = 0; i < num_completions; i++) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
-                return -1;
-            }
-            if (wc[i].opcode == IBV_WC_RECV) {
-                if (post_receive_work_request(conn, conn.buffer_size, wc[i].wr_id) != 0) {
-                    std::cerr << "Failed to repost receive work request" << std::endl;
-                    return -1;
-                }
-            }
-        }
+        poll_receive_completions(conn);
     }
 }
 

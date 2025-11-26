@@ -77,28 +77,33 @@ int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint1
     return 0;
 }
 
-int allocate_and_register_buffers(RDMAConnection& conn, uint32_t buffer_size) {
-    conn.buffer_size = buffer_size;
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        conn.buffers[i] = aligned_alloc(4096, buffer_size);
-        if (!conn.buffers[i]) {
-            std::cerr << "Could not allocate buffer" << std::endl;
-            return -1;
-        }
-        memset(conn.buffers[i], 0, buffer_size);
-        conn.memory_region[i] =
-            ibv_reg_mr(conn.protection_domain, conn.buffers[i], buffer_size,
-                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE);
-        if (!conn.memory_region[i]) {
-          std::cerr << "Could not register memory region" << std::endl;
-          return -1;
-        }
+int allocate_and_register_buffer(RDMAConnection& conn, uint32_t message_size, uint32_t num_in_flight) {
+    conn.message_size = message_size;
+    conn.num_in_flight = num_in_flight;
+    conn.buffer_size = message_size * num_in_flight;
+    
+    // Allocate a single large buffer aligned to page size
+    conn.buffer = aligned_alloc(4096, conn.buffer_size);
+    if (!conn.buffer) {
+        std::cerr << "Could not allocate buffer" << std::endl;
+        return -1;
     }
+    memset(conn.buffer, 0, conn.buffer_size);
+    
+    // Register the entire buffer as a single memory region
+    conn.memory_region = ibv_reg_mr(conn.protection_domain, conn.buffer, conn.buffer_size,
+                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                                     IBV_ACCESS_REMOTE_WRITE);
+    if (!conn.memory_region) {
+        std::cerr << "Could not register memory region" << std::endl;
+        free(conn.buffer);
+        return -1;
+    }
+    
     return 0;
 }
 
-int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size) {
+int create_protection_domain_resources(RDMAConnection& conn, uint32_t message_size, uint32_t num_in_flight) {
     // Allocate protection domain
     conn.protection_domain = ibv_alloc_pd(conn.context);
     if (!conn.protection_domain) {
@@ -106,14 +111,15 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_siz
         return -1;
     }
 
-    if (allocate_and_register_buffers(conn, buffer_size) != 0) {
-        std::cerr << "Could not allocate and register buffers" << std::endl;
+    if (allocate_and_register_buffer(conn, message_size, num_in_flight) != 0) {
+        std::cerr << "Could not allocate and register buffer" << std::endl;
         cleanup_rdma_connection(conn);
         return -1;
-    };
+    }
 
-    // Create completion queue
-    conn.completion_queue = ibv_create_cq(conn.context, 10, nullptr, nullptr, 0);
+    // Create completion queue (size should accommodate in-flight operations)
+    // Note: Client only sends, server only receives, so we only need num_in_flight
+    conn.completion_queue = ibv_create_cq(conn.context, num_in_flight, nullptr, nullptr, 0);
     if (!conn.completion_queue) {
         std::cerr << "Could not create completion queue" << std::endl;
         cleanup_rdma_connection(conn);
@@ -127,8 +133,8 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_siz
     qp_init_attr.sq_sig_all = 0;
     qp_init_attr.send_cq = conn.completion_queue;
     qp_init_attr.recv_cq = conn.completion_queue;
-    qp_init_attr.cap.max_send_wr = 10;
-    qp_init_attr.cap.max_recv_wr = 10;
+    qp_init_attr.cap.max_send_wr = num_in_flight;
+    qp_init_attr.cap.max_recv_wr = num_in_flight;
     qp_init_attr.cap.max_send_sge = 1;
     qp_init_attr.cap.max_recv_sge = 1;
     qp_init_attr.cap.max_inline_data = 0;
@@ -141,19 +147,18 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_siz
         return -1;
     }
 
-    std::cout << "Created protection domain resources: memory region (" << buffer_size 
+    std::cout << "Created protection domain resources: memory region (" << conn.buffer_size 
+              << " bytes total, " << num_in_flight << " slots of " << message_size 
               << " bytes), completion queue, queue pair" << std::endl;
     return 0;
 }
 
 void cleanup_rdma_connection(RDMAConnection& conn) {
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        if (conn.memory_region[i]) {
-            ibv_dereg_mr(conn.memory_region[i]);
-        }
-        if (conn.buffers[i]) {
-            free(conn.buffers[i]);
-        }
+    if (conn.memory_region) {
+        ibv_dereg_mr(conn.memory_region);
+    }
+    if (conn.buffer) {
+        free(conn.buffer);
     }
     if (conn.queue_pair) {
         ibv_destroy_qp(conn.queue_pair);
@@ -169,12 +174,13 @@ void cleanup_rdma_connection(RDMAConnection& conn) {
     }
 }
 
-int poll_completion(RDMAConnection& conn) {
-    struct ibv_wc wc[NUM_BUFFERS];
+int poll_receive_completions(RDMAConnection& conn) {
+    struct ibv_wc wc[32];  // Poll up to 32 completions at a time
     int num_completions = 0;
+    int total_completions = 0;
     
     do {
-        num_completions = ibv_poll_cq(conn.completion_queue, NUM_BUFFERS, wc);
+        num_completions = ibv_poll_cq(conn.completion_queue, 32, wc);
         if (num_completions < 0) {
             std::cerr << "Poll CQ failed" << std::endl;
             return -1;
@@ -184,14 +190,33 @@ int poll_completion(RDMAConnection& conn) {
                 std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
                 return -1;
             }
-            if (wc[i].opcode == IBV_WC_RECV) {
-                if (post_receive_work_request(conn, conn.buffer_size, i) != 0) {
-                    std::cerr << "Failed to repost receive work request" << std::endl;
-                    return -1;
-                }
+            // All completions are receives - repost the receive work request
+            uint32_t slot_index = wc[i].wr_id;
+            if (post_receive_work_request(conn, slot_index) != 0) {
+                std::cerr << "Failed to repost receive work request" << std::endl;
+                return -1;
             }
         }
+        total_completions += num_completions;
     } while (num_completions > 0);
+    
+    return total_completions;
+}
+
+int poll_send_completions(RDMAConnection& conn, int max_completions) {
+    struct ibv_wc wc[32];
+    int num_completions = ibv_poll_cq(conn.completion_queue, std::min(32, max_completions), wc);
+    if (num_completions < 0) {
+        std::cerr << "Poll CQ failed" << std::endl;
+        return -1;
+    }
+    
+    for (int i = 0; i < num_completions; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
+            return -1;
+        }
+    }
     
     return num_completions;
 }
@@ -439,22 +464,56 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     return 0;
 }
 
-int post_receive_work_request(RDMAConnection& conn, uint32_t size, int buffer_index) {
+int post_receive_work_request(RDMAConnection& conn, uint32_t slot_index) {
+    if (slot_index >= conn.num_in_flight) {
+        std::cerr << "Invalid slot index: " << slot_index << std::endl;
+        return -1;
+    }
+    
     struct ibv_sge sge;
-    sge.addr = (uintptr_t)conn.buffers[buffer_index];
-    sge.length = size;
-    sge.lkey = conn.memory_region[buffer_index]->lkey;
+    sge.addr = (uintptr_t)conn.buffer + (slot_index * conn.message_size);
+    sge.length = conn.message_size;
+    sge.lkey = conn.memory_region->lkey;
 
     struct ibv_recv_wr wr;
     memset(&wr, 0, sizeof(wr));
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    wr.wr_id = buffer_index;
+    wr.wr_id = slot_index;  // Store slot index for reposting
     wr.next = nullptr;
 
     struct ibv_recv_wr* bad_wr;
     if (ibv_post_recv(conn.queue_pair, &wr, &bad_wr)) {
         std::cerr << "Failed to post receive work request" << std::endl;
+        return -1;
+    }
+    
+    return 0;
+}
+
+int post_send_work_request(RDMAConnection& conn, uint32_t slot_index) {
+    if (slot_index >= conn.num_in_flight) {
+        std::cerr << "Invalid slot index: " << slot_index << std::endl;
+        return -1;
+    }
+    
+    struct ibv_sge sge;
+    sge.addr = (uintptr_t)conn.buffer + (slot_index * conn.message_size);
+    sge.length = conn.message_size;
+    sge.lkey = conn.memory_region->lkey;
+
+    struct ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr_id = slot_index;  // Store slot index for tracking
+    wr.next = nullptr;
+
+    struct ibv_send_wr* bad_wr;
+    if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
+        std::cerr << "Failed to post send work request" << std::endl;
         return -1;
     }
     
