@@ -119,6 +119,22 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_siz
         std::cerr << "Could not create completion queue" << std::endl;
         return -1;
     }
+    
+    // Configure CQ moderation to match ib_send_bw behavior
+    // cq_count=1 means generate event after 1 completion (minimal batching)
+    // cq_period=0 means no timeout (only count-based)
+    // Note: CQ moderation is primarily useful for interrupt-driven applications.
+    // Since we're using polling, the benefit is minimal, but we set it to match ib_send_bw.
+    struct ibv_modify_cq_attr cq_attr;
+    memset(&cq_attr, 0, sizeof(cq_attr));
+    cq_attr.attr_mask = IBV_CQ_ATTR_MODERATE;
+    cq_attr.moderate.cq_count = 1;  // Match ib_send_bw "CQ Moderation: 1"
+    cq_attr.moderate.cq_period = 0; // No timeout
+    if (ibv_modify_cq(conn.completion_queue, &cq_attr)) {
+        // CQ moderation might not be supported on all devices, so this is not fatal
+        // Just log a warning and continue
+        std::cerr << "Warning: Could not set CQ moderation (may not be supported)" << std::endl;
+    }
 
     // Create queue pair attributes
     struct ibv_qp_init_attr qp_init_attr;

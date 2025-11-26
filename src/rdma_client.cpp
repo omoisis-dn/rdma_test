@@ -1,6 +1,7 @@
 #include "rdma_client.h"
 #include "rdma_common.h"
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -171,6 +172,8 @@ double measure_bandwidth(RDMAConnection& conn, uint32_t buffer_size, uint32_t ch
     double total_bytes = (double)buffer_size * num_iterations;
     double duration_seconds = duration / 1e9;
     double bandwidth_gbps = (total_bytes * 8) / (duration_seconds * 1e9);
+
+    std::cout << "Duration: " << std::fixed << std::setprecision(3) << duration_seconds << " seconds" << std::endl;
     
     return bandwidth_gbps;
 }
