@@ -20,6 +20,8 @@ struct RDMAConnection {
     union ibv_gid local_gid;
     union ibv_gid remote_gid;
     uint8_t gid_index;
+    uint64_t remote_buffer_addr;  // Remote buffer address for RDMA WRITE
+    uint32_t remote_rkey;         // Remote memory region key for RDMA WRITE
 };
 
 // Test configuration
@@ -46,22 +48,21 @@ struct TestParams {
 struct QPInfo {
     uint32_t qp_num;
     union ibv_gid gid;
+    uint64_t remote_buffer_addr;  // Remote buffer address for RDMA WRITE
+    uint32_t remote_rkey;         // Remote memory region key for RDMA WRITE
 };
 
 // Function declarations
 int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint16_t port);
 int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight);
-int post_send_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_size);
+int post_rdma_write_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_size);
 void cleanup_rdma_connection(RDMAConnection& conn);
 void cleanup_rdma_test_resources(RDMAConnection& conn);  // Cleanup only test-specific resources (buffer, MR, CQ, QP)
-int poll_receive_completions(RDMAConnection& conn);
 int poll_send_completions(RDMAConnection& conn, int max_completions);
 int list_rdma_devices();
 int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, TestParams& test_params);
 int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, const TestParams& test_params);
 int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info);
-int post_receive_work_request(RDMAConnection& conn, uint32_t slot_index);
-int post_send_work_request(RDMAConnection& conn, uint32_t slot_index);
 
 #endif // RDMA_COMMON_H
 

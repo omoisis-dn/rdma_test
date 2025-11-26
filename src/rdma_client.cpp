@@ -103,8 +103,8 @@ double measure_latency(RDMAConnection& conn, uint32_t buffer_size, uint32_t chun
     auto start = std::chrono::high_resolution_clock::now();
     
     for (uint32_t i = 0; i < num_iterations; i++) {
-        // Send the entire buffer as a single chunk for latency measurement
-        if (post_send_chunk(conn, 0, buffer_size) != 0) {
+        // Send the entire buffer as a single chunk for latency measurement using RDMA WRITE
+        if (post_rdma_write_chunk(conn, 0, buffer_size) != 0) {
             std::cerr << "Failed to post send" << std::endl;
             return -1.0;
         }
@@ -151,7 +151,7 @@ double measure_bandwidth(RDMAConnection& conn, uint32_t buffer_size, uint32_t ch
             uint32_t chunk_in_iteration = chunks_sent % chunks_per_iteration;
             uint32_t chunk_offset = chunk_in_iteration * chunk_size;
             
-            if (post_send_chunk(conn, chunk_offset, chunk_size) != 0) {
+            if (post_rdma_write_chunk(conn, chunk_offset, chunk_size) != 0) {
                 std::cerr << "Failed to post send" << std::endl;
                 return -1.0;
             }

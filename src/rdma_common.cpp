@@ -196,34 +196,8 @@ void cleanup_rdma_connection(RDMAConnection& conn) {
     }
 }
 
-int poll_receive_completions(RDMAConnection& conn) {
-    struct ibv_wc wc[32];  // Poll up to 32 completions at a time
-    int num_completions = 0;
-    int total_completions = 0;
-    
-    do {
-        num_completions = ibv_poll_cq(conn.completion_queue, 32, wc);
-        if (num_completions < 0) {
-            std::cerr << "Poll CQ failed" << std::endl;
-            return -1;
-        }
-        for (int i = 0; i < num_completions; i++) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
-                return -1;
-            }
-            // All completions are receives - repost the receive work request
-            uint32_t slot_index = wc[i].wr_id;
-            if (post_receive_work_request(conn, slot_index) != 0) {
-                std::cerr << "Failed to repost receive work request" << std::endl;
-                return -1;
-            }
-        }
-        total_completions += num_completions;
-    } while (num_completions > 0);
-    
-    return total_completions;
-}
+// poll_receive_completions removed - not needed for RDMA WRITE (one-sided operation)
+// The server doesn't need to poll for receives since RDMA WRITE writes directly to the buffer
 
 int poll_send_completions(RDMAConnection& conn, int max_completions) {
     struct ibv_wc wc[32];
@@ -362,10 +336,12 @@ int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, Te
     
     std::cout << "Server QP initialized. QP number: " << conn.queue_pair->qp_num << std::endl;
     
-    // Step 4: Send our QP info to client
+    // Step 4: Send our QP info and buffer info to client (for RDMA WRITE)
     QPInfo local_info;
     local_info.qp_num = conn.queue_pair->qp_num;
     local_info.gid = conn.local_gid;
+    local_info.remote_buffer_addr = (uint64_t)conn.buffer;  // Server's buffer address
+    local_info.remote_rkey = conn.memory_region->rkey;       // Server's memory region key
     
     if (send(sockfd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
         std::cerr << "Failed to send QP info" << std::endl;
@@ -436,10 +412,12 @@ int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, co
         return -1;
     }
     
-    // Step 5: Send our QP info to server
+    // Step 5: Send our QP info to server (client doesn't need to send buffer info for RDMA WRITE)
     QPInfo local_info;
     local_info.qp_num = conn.queue_pair->qp_num;
     local_info.gid = conn.local_gid;
+    local_info.remote_buffer_addr = 0;  // Not needed from client
+    local_info.remote_rkey = 0;         // Not needed from client
     
     if (send(sockfd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
         std::cerr << "Failed to send QP info" << std::endl;
@@ -447,6 +425,9 @@ int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, co
     }
     
     conn.remote_gid = server_info.gid;
+    // Store remote buffer address and rkey for RDMA WRITE operations
+    conn.remote_buffer_addr = server_info.remote_buffer_addr;
+    conn.remote_rkey = server_info.remote_rkey;
     
     // Step 6: Connect QP to RTS
     if (connect_qp_to_rts(conn, server_info) != 0) {
@@ -590,7 +571,7 @@ int post_receive_work_request(RDMAConnection& conn, uint32_t slot_index) {
     return 0;
 }
 
-int post_send_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_size) {
+int post_rdma_write_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_size) {
     // Validate chunk offset and size
     if (chunk_offset + chunk_size > conn.buffer_size) {
         std::cerr << "Invalid chunk: offset " << chunk_offset 
@@ -608,14 +589,16 @@ int post_send_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_
     memset(&wr, 0, sizeof(wr));
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND;
+    wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.wr_id = chunk_offset;  // Store chunk offset for tracking
+    wr.wr.rdma.remote_addr = conn.remote_buffer_addr + chunk_offset;  // Remote address for this chunk
+    wr.wr.rdma.rkey = conn.remote_rkey;  // Remote memory region key
     wr.next = nullptr;
 
     struct ibv_send_wr* bad_wr;
     if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
-        std::cerr << "Failed to post send work request" << std::endl;
+        std::cerr << "Failed to post RDMA write work request" << std::endl;
         return -1;
     }
     

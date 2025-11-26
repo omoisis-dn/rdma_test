@@ -65,19 +65,12 @@ int create_server_socket(uint16_t port) {
     return sockfd;
 }
 
-int serve_test(RDMAConnection& conn, int client_sock) {
-    // Post initial receive work requests for all in-flight slots
-    for (uint32_t i = 0; i < conn.num_in_flight; i++) {
-        if (post_receive_work_request(conn, i) != 0) {
-            std::cerr << "Failed to post initial receive work request for slot " << i << std::endl;
-            return -1;
-        }
-    }
-    
-    std::cout << "Posted " << conn.num_in_flight << " initial receive work requests" << std::endl;
+int serve_test(RDMAConnection& /* conn */, int client_sock) {
+    // RDMA WRITE is one-sided - no need to post receives
+    // The client writes directly to the server's buffer
     std::cout << "Test started. Waiting for completion signal..." << std::endl;
     
-    // Keep polling for receive completions until client signals test is done
+    // Wait for client to signal test completion
     // Client will send a single byte (0) when test is complete
     char test_done = 0;
     fd_set readfds;
@@ -108,9 +101,6 @@ int serve_test(RDMAConnection& conn, int client_sock) {
             std::cerr << "Select error: " << strerror(errno) << std::endl;
             return -1;
         }
-        
-        // Poll for RDMA completions
-        poll_receive_completions(conn);
     }
     
     return 0;
