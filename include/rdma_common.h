@@ -5,6 +5,12 @@
 #include <string>
 #include <cstdint>
 
+#ifdef USE_GPU_MEMORY
+// Only include HIP runtime API, not device code compilation support
+#define __HIP_PLATFORM_AMD__
+#include <hip/hip_runtime_api.h>
+#endif
+
 // RDMA connection parameters (RoCE only)
 struct RDMAConnection {
     struct ibv_context* context;

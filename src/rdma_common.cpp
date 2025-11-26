@@ -8,6 +8,12 @@
 #include <unistd.h>
 #include <errno.h>
 
+#ifdef USE_GPU_MEMORY
+// Only include HIP runtime API, not device code compilation support
+#define __HIP_PLATFORM_AMD__
+#include <hip/hip_runtime_api.h>
+#endif
+
 int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint16_t port) {
     // Get device list
     int num_devices;
@@ -80,21 +86,46 @@ int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint1
 int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size) {
     conn.buffer_size = buffer_size;
     
-    // Allocate a single large buffer aligned to page size
+#ifdef USE_GPU_MEMORY
+    // Allocate GPU device memory using HIP
+    hipError_t hip_err = hipMalloc(&conn.buffer, conn.buffer_size);
+    if (hip_err != hipSuccess) {
+        std::cerr << "Could not allocate GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
+        return -1;
+    }
+    
+    // Initialize GPU buffer to zero
+    hip_err = hipMemset(conn.buffer, 0, conn.buffer_size);
+    if (hip_err != hipSuccess) {
+        std::cerr << "Could not initialize GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
+        (void)hipFree(conn.buffer);  // Ignore error during cleanup
+        return -1;
+    }
+    
+    std::cout << "Allocated " << conn.buffer_size << " bytes on GPU device" << std::endl;
+#else
+    // Allocate a single large buffer aligned to page size (host memory)
     conn.buffer = aligned_alloc(4096, conn.buffer_size);
     if (!conn.buffer) {
         std::cerr << "Could not allocate buffer" << std::endl;
         return -1;
     }
     memset(conn.buffer, 0, conn.buffer_size);
+    std::cout << "Allocated " << conn.buffer_size << " bytes on host" << std::endl;
+#endif
     
     // Register the entire buffer as a single memory region
+    // Note: ibv_reg_mr should work with GPU memory if GPU Direct RDMA is supported
     conn.memory_region = ibv_reg_mr(conn.protection_domain, conn.buffer, conn.buffer_size,
                                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                                      IBV_ACCESS_REMOTE_WRITE);
     if (!conn.memory_region) {
         std::cerr << "Could not register memory region" << std::endl;
+#ifdef USE_GPU_MEMORY
+        (void)hipFree(conn.buffer);  // Ignore error during cleanup
+#else
         free(conn.buffer);
+#endif
         return -1;
     }
     
@@ -171,7 +202,14 @@ void cleanup_rdma_test_resources(RDMAConnection& conn) {
         conn.memory_region = nullptr;
     }
     if (conn.buffer) {
+#ifdef USE_GPU_MEMORY
+        hipError_t hip_err = hipFree(conn.buffer);
+        if (hip_err != hipSuccess) {
+            std::cerr << "Warning: hipFree failed: " << hipGetErrorString(hip_err) << std::endl;
+        }
+#else
         free(conn.buffer);
+#endif
         conn.buffer = nullptr;
     }
     if (conn.queue_pair) {
