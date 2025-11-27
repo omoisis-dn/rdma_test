@@ -13,8 +13,10 @@
 struct RDMAConnection {
     struct ibv_context* context;
     struct ibv_pd* protection_domain;
-    struct ibv_cq* completion_queue;
-    struct ibv_qp* queue_pair;
+    struct ibv_cq** completion_queues;  // Array of completion queues (one per QP)
+    struct ibv_qp** queue_pairs;        // Array of queue pairs
+    uint32_t num_queue_pairs;          // Number of queue pairs
+    uint32_t next_qp_index;            // Round-robin index for selecting QP
     struct ibv_mr* memory_region;
     void* buffer;
     uint32_t buffer_size;      // Total buffer size (total data to transfer per iteration)
@@ -34,6 +36,7 @@ struct TestConfig {
     uint32_t chunk_size;        // Size of each chunk to send/receive
     uint32_t num_iterations;    // Number of iterations (each iteration transfers buffer_size bytes)
     uint32_t num_in_flight;     // Number of parallel in-flight chunks
+    uint32_t num_queue_pairs;   // Number of queue pairs to use (default: 1)
     bool measure_latency;
     bool measure_bandwidth;
     std::string device_name;
@@ -48,6 +51,7 @@ struct TestParams {
     uint32_t buffer_size;
     uint32_t chunk_size;
     uint32_t num_in_flight;
+    uint32_t num_queue_pairs;
 };
 
 // QP information exchange structure
@@ -60,14 +64,14 @@ struct QPInfo {
 
 // Function declarations
 int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint16_t port);
-int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight, bool use_gpu_memory, int gpu_device_id);
+int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight, uint32_t num_queue_pairs, bool use_gpu_memory, int gpu_device_id);
 int post_rdma_write_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t chunk_size);
 void cleanup_rdma_connection(RDMAConnection& conn);
 void cleanup_rdma_test_resources(RDMAConnection& conn);  // Cleanup only test-specific resources (buffer, MR, CQ, QP)
 int poll_send_completions(RDMAConnection& conn, int max_completions);
 int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, TestParams& test_params, bool use_gpu_memory, int gpu_device_id);
 int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, const TestParams& test_params, bool use_gpu_memory, int gpu_device_id);
-int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info);
+int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info, uint32_t qp_index = 0);
 int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size, bool use_gpu_memory, int gpu_device_id);
 
 #endif // RDMA_COMMON_H

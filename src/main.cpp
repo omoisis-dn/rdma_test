@@ -69,6 +69,7 @@ void print_usage(const char* program_name) {
               << "                            Examples: 256K, 1M, 4096\n"
               << "  -n, --iterations <num>     Number of iterations (default: 1000)\n"
               << "  -f, --in-flight <num>      Number of parallel in-flight operations (default: 1)\n"
+              << "  -q, --queue-pairs <num>    Number of queue pairs to use (default: 1)\n"
               << "  -l, --latency             Measure latency\n"
               << "  -b, --bandwidth           Measure bandwidth\n"
               << "  -h, --help                Show this help message\n"
@@ -81,6 +82,7 @@ int main(int argc, char* argv[]) {
     config.chunk_size = 4096;
     config.num_iterations = 1000;
     config.num_in_flight = 1;
+    config.num_queue_pairs = 1;  // Default to single queue pair
     config.measure_latency = false;
     config.measure_bandwidth = false;
     config.device_name = "";
@@ -188,6 +190,19 @@ int main(int argc, char* argv[]) {
                 config.num_in_flight = std::stoul(argv[++i]);
             } else {
                 std::cerr << "Error: --in-flight requires a number" << std::endl;
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--queue-pairs") == 0) {
+            if (i + 1 < argc) {
+                config.num_queue_pairs = std::stoul(argv[++i]);
+                if (config.num_queue_pairs == 0) {
+                    std::cerr << "Error: --queue-pairs must be at least 1" << std::endl;
+                    print_usage(argv[0]);
+                    return 1;
+                }
+            } else {
+                std::cerr << "Error: --queue-pairs requires a number" << std::endl;
                 print_usage(argv[0]);
                 return 1;
             }

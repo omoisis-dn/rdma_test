@@ -102,7 +102,7 @@ int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size, boo
         hip_err = hipMemset(conn.buffer, 0, conn.buffer_size);
         if (hip_err != hipSuccess) {
             std::cerr << "Could not initialize GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
-            (void)hipFree(conn.buffer);  // Ignore error during cleanup
+            cleanup_rdma_test_resources(conn);
             return -1;
         }
         
@@ -125,60 +125,80 @@ int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size, boo
                                      IBV_ACCESS_REMOTE_WRITE);
     if (!conn.memory_region) {
         std::cerr << "Could not register memory region" << std::endl;
-        if (use_gpu_memory) {
-            (void)hipFree(conn.buffer);  // Ignore error during cleanup
-        } else {
-            free(conn.buffer);
-        }
+        cleanup_rdma_test_resources(conn);
         return -1;
     }
     
     return 0;
 }
 
-int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight, bool use_gpu_memory, int gpu_device_id) {
+int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight, uint32_t num_queue_pairs, bool use_gpu_memory, int gpu_device_id) {
     // Note: Protection domain should already be allocated before calling this function
     
     conn.chunk_size = chunk_size;
     conn.num_in_flight = num_in_flight;
+    conn.num_queue_pairs = num_queue_pairs;
+    conn.next_qp_index = 0;
     
     if (allocate_and_register_buffer(conn, buffer_size, use_gpu_memory, gpu_device_id) != 0) {
         std::cerr << "Could not allocate and register buffer" << std::endl;
         return -1;
     }
 
-    // Create completion queue (size should accommodate in-flight operations)
-    // Note: Client only sends, server only receives, so we only need num_in_flight
-    conn.completion_queue = ibv_create_cq(conn.context, num_in_flight, nullptr, nullptr, 0);
-    if (!conn.completion_queue) {
-        std::cerr << "Could not create completion queue" << std::endl;
+    // Allocate arrays for multiple QPs and CQs
+    conn.completion_queues = new struct ibv_cq*[num_queue_pairs];
+    conn.queue_pairs = new struct ibv_qp*[num_queue_pairs];
+    if (!conn.completion_queues || !conn.queue_pairs) {
+        std::cerr << "Could not allocate arrays for queue pairs" << std::endl;
+        cleanup_rdma_test_resources(conn);
         return -1;
     }
+    
+    // Initialize arrays
+    for (uint32_t i = 0; i < num_queue_pairs; i++) {
+        conn.completion_queues[i] = nullptr;
+        conn.queue_pairs[i] = nullptr;
+    }
 
+    // Create completion queues (one per QP)
+    // Note: Client only sends, server only receives, so we only need num_in_flight
+    for (uint32_t i = 0; i < num_queue_pairs; i++) {
+        conn.completion_queues[i] = ibv_create_cq(conn.context, num_in_flight, nullptr, nullptr, 0);
+        if (!conn.completion_queues[i]) {
+            std::cerr << "Could not create completion queue " << i << std::endl;
+            cleanup_rdma_test_resources(conn);
+            return -1;
+        }
+    }
+    
     // Create queue pair attributes
     struct ibv_qp_init_attr qp_init_attr;
     memset(&qp_init_attr, 0, sizeof(qp_init_attr));
     qp_init_attr.qp_type = IBV_QPT_RC;
     qp_init_attr.sq_sig_all = 0;
-    qp_init_attr.send_cq = conn.completion_queue;
-    qp_init_attr.recv_cq = conn.completion_queue;
     qp_init_attr.cap.max_send_wr = num_in_flight;
     qp_init_attr.cap.max_recv_wr = num_in_flight;
     qp_init_attr.cap.max_send_sge = 1;
     qp_init_attr.cap.max_recv_sge = 1;
     qp_init_attr.cap.max_inline_data = 0;
 
-    // Create queue pair
-    conn.queue_pair = ibv_create_qp(conn.protection_domain, &qp_init_attr);
-    if (!conn.queue_pair) {
-        std::cerr << "Could not create queue pair" << std::endl;
-        return -1;
+    // Create queue pairs
+    for (uint32_t i = 0; i < num_queue_pairs; i++) {
+        qp_init_attr.send_cq = conn.completion_queues[i];
+        qp_init_attr.recv_cq = conn.completion_queues[i];
+        
+        conn.queue_pairs[i] = ibv_create_qp(conn.protection_domain, &qp_init_attr);
+        if (!conn.queue_pairs[i]) {
+            std::cerr << "Could not create queue pair " << i << std::endl;
+            cleanup_rdma_test_resources(conn);
+            return -1;
+        }
     }
 
     std::cout << "Created protection domain resources: memory region (" << conn.buffer_size 
               << " bytes total), chunk size: " << chunk_size 
               << " bytes, in-flight: " << num_in_flight 
-              << ", completion queue, queue pair" << std::endl;
+              << ", " << num_queue_pairs << " completion queue(s), " << num_queue_pairs << " queue pair(s)" << std::endl;
     return 0;
 }
 
@@ -199,14 +219,29 @@ void cleanup_rdma_test_resources(RDMAConnection& conn) {
         }
         conn.buffer = nullptr;
     }
-    if (conn.queue_pair) {
-        ibv_destroy_qp(conn.queue_pair);
-        conn.queue_pair = nullptr;
+    
+    // Cleanup multiple QPs and CQs
+    if (conn.queue_pairs) {
+        for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+            if (conn.queue_pairs[i]) {
+                ibv_destroy_qp(conn.queue_pairs[i]);
+            }
+        }
+        delete[] conn.queue_pairs;
+        conn.queue_pairs = nullptr;
     }
-    if (conn.completion_queue) {
-        ibv_destroy_cq(conn.completion_queue);
-        conn.completion_queue = nullptr;
+    
+    if (conn.completion_queues) {
+        for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+            if (conn.completion_queues[i]) {
+                ibv_destroy_cq(conn.completion_queues[i]);
+            }
+        }
+        delete[] conn.completion_queues;
+        conn.completion_queues = nullptr;
     }
+    
+    conn.num_queue_pairs = 0;
 }
 
 void cleanup_rdma_connection(RDMAConnection& conn) {
@@ -225,21 +260,28 @@ void cleanup_rdma_connection(RDMAConnection& conn) {
 // The server doesn't need to poll for receives since RDMA WRITE writes directly to the buffer
 
 int poll_send_completions(RDMAConnection& conn, int max_completions) {
+    int total_completions = 0;
     struct ibv_wc wc[32];
-    int num_completions = ibv_poll_cq(conn.completion_queue, std::min(32, max_completions), wc);
-    if (num_completions < 0) {
-        std::cerr << "Poll CQ failed" << std::endl;
-        return -1;
-    }
     
-    for (int i = 0; i < num_completions; i++) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
-            std::cerr << "Work completion error: " << ibv_wc_status_str(wc[i].status) << std::endl;
+    // Poll all completion queues
+    for (uint32_t qp_idx = 0; qp_idx < conn.num_queue_pairs && total_completions < max_completions; qp_idx++) {
+        int num_completions = ibv_poll_cq(conn.completion_queues[qp_idx], std::min(32, max_completions), wc);
+        if (num_completions < 0) {
+            std::cerr << "Poll CQ failed for QP " << qp_idx << std::endl;
             return -1;
         }
+        
+        for (int i = 0; i < num_completions; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                std::cerr << "Work completion error on QP " << qp_idx << ": " << ibv_wc_status_str(wc[i].status) << std::endl;
+                return -1;
+            }
+        }
+        
+        total_completions += num_completions;
     }
     
-    return num_completions;
+    return total_completions;
 }
 
 int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, TestParams& test_params, bool use_gpu_memory, int gpu_device_id) {
@@ -265,12 +307,12 @@ int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, Te
     test_params = client_params;
     
     // Step 2: Now initialize buffers with the received parameters
-    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight, use_gpu_memory, gpu_device_id) != 0) {
+    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight, test_params.num_queue_pairs, use_gpu_memory, gpu_device_id) != 0) {
         std::cerr << "Failed to create protection domain resources" << std::endl;
         return -1;
     }
     
-    // Step 3: Transition QP to INIT
+    // Step 3: Transition all QPs to INIT
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
@@ -279,46 +321,76 @@ int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, Te
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_REMOTE_WRITE;
     
-    if (ibv_modify_qp(conn.queue_pair, &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-        std::cerr << "Failed to modify QP to INIT" << std::endl;
-        return -1;
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        if (ibv_modify_qp(conn.queue_pairs[i], &attr,
+                          IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            std::cerr << "Failed to modify QP " << i << " to INIT" << std::endl;
+            return -1;
+        }
     }
     
-    std::cout << "Server QP initialized. QP number: " << conn.queue_pair->qp_num << std::endl;
+    std::cout << "Server QPs initialized. QP numbers: ";
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        std::cout << conn.queue_pairs[i]->qp_num;
+        if (i < conn.num_queue_pairs - 1) std::cout << ", ";
+    }
+    std::cout << std::endl;
     
     // Step 4: Send our QP info and buffer info to client (for RDMA WRITE)
-    QPInfo local_info;
-    local_info.qp_num = conn.queue_pair->qp_num;
-    local_info.gid = conn.local_gid;
-    local_info.remote_buffer_addr = (uint64_t)conn.buffer;  // Server's buffer address
-    local_info.remote_rkey = conn.memory_region->rkey;       // Server's memory region key
+    // Send buffer info once (same for all QPs)
+    QPInfo buffer_info;
+    buffer_info.qp_num = 0;  // Not used for buffer info
+    buffer_info.gid = conn.local_gid;
+    buffer_info.remote_buffer_addr = (uint64_t)conn.buffer;  // Server's buffer address
+    buffer_info.remote_rkey = conn.memory_region->rkey;       // Server's memory region key
     
-    if (send(sockfd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
-        std::cerr << "Failed to send QP info" << std::endl;
+    if (send(sockfd, &buffer_info, sizeof(buffer_info), 0) != sizeof(buffer_info)) {
+        std::cerr << "Failed to send buffer info" << std::endl;
         return -1;
     }
+    
+    // Send QP info for each QP
+    QPInfo* local_qp_infos = new QPInfo[conn.num_queue_pairs];
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        local_qp_infos[i].qp_num = conn.queue_pairs[i]->qp_num;
+        local_qp_infos[i].gid = conn.local_gid;
+        local_qp_infos[i].remote_buffer_addr = 0;  // Not needed
+        local_qp_infos[i].remote_rkey = 0;         // Not needed
+    }
+    
+    if (send(sockfd, local_qp_infos, sizeof(QPInfo) * conn.num_queue_pairs, 0) != (ssize_t)(sizeof(QPInfo) * conn.num_queue_pairs)) {
+        std::cerr << "Failed to send QP info" << std::endl;
+        delete[] local_qp_infos;
+        return -1;
+    }
+    delete[] local_qp_infos;
     
     // Step 5: Receive client's QP info
-    QPInfo remote_info;
-    if (recv(sockfd, &remote_info, sizeof(remote_info), 0) != sizeof(remote_info)) {
+    QPInfo* remote_qp_infos = new QPInfo[conn.num_queue_pairs];
+    if (recv(sockfd, remote_qp_infos, sizeof(QPInfo) * conn.num_queue_pairs, 0) != (ssize_t)(sizeof(QPInfo) * conn.num_queue_pairs)) {
         std::cerr << "Failed to receive QP info" << std::endl;
+        delete[] remote_qp_infos;
         return -1;
     }
     
-    conn.remote_gid = remote_info.gid;
+    // Use first QP's GID (all should be the same)
+    conn.remote_gid = remote_qp_infos[0].gid;
     
-    // Step 6: Connect QP to RTS
-    if (connect_qp_to_rts(conn, remote_info) != 0) {
-        return -1;
+    // Step 6: Connect all QPs to RTS
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        if (connect_qp_to_rts(conn, remote_qp_infos[i], i) != 0) {
+            delete[] remote_qp_infos;
+            return -1;
+        }
     }
+    delete[] remote_qp_infos;
     
-    std::cout << "QP connected. Remote GID: ";
+    std::cout << "QPs connected. Remote GID: ";
     for (int i = 0; i < 16; i++) {
-        printf("%02x", remote_info.gid.raw[i]);
+        printf("%02x", conn.remote_gid.raw[i]);
         if (i == 7) printf(":");
     }
-    std::cout << ", Remote QP: " << remote_info.qp_num << std::endl;
+    std::cout << std::endl;
     return 0;
 }
 
@@ -331,15 +403,16 @@ int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, co
     
     std::cout << "Sent test parameters to server: buffer_size=" << test_params.buffer_size
               << ", chunk_size=" << test_params.chunk_size
-              << ", num_in_flight=" << test_params.num_in_flight << std::endl;
+              << ", num_in_flight=" << test_params.num_in_flight
+              << ", num_queue_pairs=" << test_params.num_queue_pairs << std::endl;
     
     // Step 2: Now initialize buffers with the same parameters
-    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight, use_gpu_memory, gpu_device_id) != 0) {
+    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight, test_params.num_queue_pairs, use_gpu_memory, gpu_device_id) != 0) {
         std::cerr << "Failed to create protection domain resources" << std::endl;
         return -1;
     }
     
-    // Step 3: Transition QP to INIT
+    // Step 3: Transition all QPs to INIT
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
@@ -348,53 +421,83 @@ int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, co
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_REMOTE_WRITE;
     
-    if (ibv_modify_qp(conn.queue_pair, &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-        std::cerr << "Failed to modify QP to INIT" << std::endl;
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        if (ibv_modify_qp(conn.queue_pairs[i], &attr,
+                          IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            std::cerr << "Failed to modify QP " << i << " to INIT" << std::endl;
+            return -1;
+        }
+    }
+    
+    std::cout << "Client QPs initialized. QP numbers: ";
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        std::cout << conn.queue_pairs[i]->qp_num;
+        if (i < conn.num_queue_pairs - 1) std::cout << ", ";
+    }
+    std::cout << std::endl;
+    
+    // Step 4: Receive server's buffer info
+    QPInfo server_buffer_info;
+    if (recv(sockfd, &server_buffer_info, sizeof(server_buffer_info), 0) != sizeof(server_buffer_info)) {
+        std::cerr << "Failed to receive server buffer info" << std::endl;
         return -1;
     }
     
-    std::cout << "Client QP initialized. QP number: " << conn.queue_pair->qp_num << std::endl;
-    
-    // Step 4: Receive server's QP info
-    QPInfo server_info;
-    if (recv(sockfd, &server_info, sizeof(server_info), 0) != sizeof(server_info)) {
-        std::cerr << "Failed to receive server QP info" << std::endl;
-        return -1;
-    }
-    
-    // Step 5: Send our QP info to server (client doesn't need to send buffer info for RDMA WRITE)
-    QPInfo local_info;
-    local_info.qp_num = conn.queue_pair->qp_num;
-    local_info.gid = conn.local_gid;
-    local_info.remote_buffer_addr = 0;  // Not needed from client
-    local_info.remote_rkey = 0;         // Not needed from client
-    
-    if (send(sockfd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
-        std::cerr << "Failed to send QP info" << std::endl;
-        return -1;
-    }
-    
-    conn.remote_gid = server_info.gid;
+    conn.remote_gid = server_buffer_info.gid;
     // Store remote buffer address and rkey for RDMA WRITE operations
-    conn.remote_buffer_addr = server_info.remote_buffer_addr;
-    conn.remote_rkey = server_info.remote_rkey;
+    conn.remote_buffer_addr = server_buffer_info.remote_buffer_addr;
+    conn.remote_rkey = server_buffer_info.remote_rkey;
     
-    // Step 6: Connect QP to RTS
-    if (connect_qp_to_rts(conn, server_info) != 0) {
+    // Receive server's QP info
+    QPInfo* server_qp_infos = new QPInfo[conn.num_queue_pairs];
+    if (recv(sockfd, server_qp_infos, sizeof(QPInfo) * conn.num_queue_pairs, 0) != (ssize_t)(sizeof(QPInfo) * conn.num_queue_pairs)) {
+        std::cerr << "Failed to receive server QP info" << std::endl;
+        delete[] server_qp_infos;
         return -1;
     }
     
-    std::cout << "QP connected. Remote GID: ";
+    // Step 5: Send our QP info to server
+    QPInfo* local_qp_infos = new QPInfo[conn.num_queue_pairs];
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        local_qp_infos[i].qp_num = conn.queue_pairs[i]->qp_num;
+        local_qp_infos[i].gid = conn.local_gid;
+        local_qp_infos[i].remote_buffer_addr = 0;  // Not needed from client
+        local_qp_infos[i].remote_rkey = 0;         // Not needed from client
+    }
+    
+    if (send(sockfd, local_qp_infos, sizeof(QPInfo) * conn.num_queue_pairs, 0) != (ssize_t)(sizeof(QPInfo) * conn.num_queue_pairs)) {
+        std::cerr << "Failed to send QP info" << std::endl;
+        delete[] local_qp_infos;
+        delete[] server_qp_infos;
+        return -1;
+    }
+    delete[] local_qp_infos;
+    
+    // Step 6: Connect all QPs to RTS
+    for (uint32_t i = 0; i < conn.num_queue_pairs; i++) {
+        if (connect_qp_to_rts(conn, server_qp_infos[i], i) != 0) {
+            delete[] server_qp_infos;
+            return -1;
+        }
+    }
+    delete[] server_qp_infos;
+    
+    std::cout << "QPs connected. Remote GID: ";
     for (int i = 0; i < 16; i++) {
-        printf("%02x", server_info.gid.raw[i]);
+        printf("%02x", conn.remote_gid.raw[i]);
         if (i == 7) printf(":");
     }
-    std::cout << ", Remote QP: " << server_info.qp_num << std::endl;
+    std::cout << std::endl;
     return 0;
 }
 
-int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
+int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info, uint32_t qp_index) {
+    // Select the QP to use
+    if (qp_index >= conn.num_queue_pairs) {
+        std::cerr << "Invalid QP index: " << qp_index << " (max: " << conn.num_queue_pairs << ")" << std::endl;
+        return -1;
+    }
+    struct ibv_qp* qp = conn.queue_pairs[qp_index];
     // Query port attributes to get actual MTU
     struct ibv_port_attr port_attr;
     if (ibv_query_port(conn.context, conn.port_num, &port_attr)) {
@@ -453,8 +556,8 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
     
-    if (ibv_modify_qp(conn.queue_pair, &attr, flags)) {
-        std::cerr << "Failed to modify QP to RTR: " << strerror(errno) << std::endl;
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        std::cerr << "Failed to modify QP " << qp_index << " to RTR: " << strerror(errno) << std::endl;
         std::cerr << "  Local GID: ";
         for (int i = 0; i < 16; i++) {
             printf("%02x", conn.local_gid.raw[i]);
@@ -487,8 +590,8 @@ int connect_qp_to_rts(RDMAConnection& conn, const QPInfo& remote_info) {
     flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
             IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
     
-    if (ibv_modify_qp(conn.queue_pair, &attr, flags)) {
-        std::cerr << "Failed to modify QP to RTS: " << strerror(errno) << std::endl;
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        std::cerr << "Failed to modify QP " << qp_index << " to RTS: " << strerror(errno) << std::endl;
         return -1;
     }
     
@@ -513,8 +616,9 @@ int post_receive_work_request(RDMAConnection& conn, uint32_t slot_index) {
     wr.wr_id = slot_index;  // Store slot index for reposting
     wr.next = nullptr;
 
+    // Use first QP for receive (for RDMA WRITE, server doesn't need receives, but if this is used, use QP 0)
     struct ibv_recv_wr* bad_wr;
-    if (ibv_post_recv(conn.queue_pair, &wr, &bad_wr)) {
+    if (ibv_post_recv(conn.queue_pairs[0], &wr, &bad_wr)) {
         std::cerr << "Failed to post receive work request" << std::endl;
         return -1;
     }
@@ -547,8 +651,13 @@ int post_rdma_write_chunk(RDMAConnection& conn, uint32_t chunk_offset, uint32_t 
     wr.wr.rdma.rkey = conn.remote_rkey;  // Remote memory region key
     wr.next = nullptr;
 
+    // Select QP using round-robin
+    uint32_t qp_idx = conn.next_qp_index;
+    struct ibv_qp* qp_to_use = conn.queue_pairs[qp_idx];
+    conn.next_qp_index = (conn.next_qp_index + 1) % conn.num_queue_pairs;
+
     struct ibv_send_wr* bad_wr;
-    if (ibv_post_send(conn.queue_pair, &wr, &bad_wr)) {
+    if (ibv_post_send(qp_to_use, &wr, &bad_wr)) {
         std::cerr << "Failed to post RDMA write work request" << std::endl;
         return -1;
     }

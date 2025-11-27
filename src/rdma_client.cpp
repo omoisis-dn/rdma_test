@@ -47,6 +47,7 @@ int setup_client_connection(RDMAConnection& conn, const TestConfig& config, cons
     test_params.buffer_size = config.buffer_size;
     test_params.chunk_size = config.chunk_size;
     test_params.num_in_flight = config.num_in_flight;
+    test_params.num_queue_pairs = config.num_queue_pairs;
     
     // Exchange test parameters and QP information (socket stays open)
     if (exchange_test_params_and_qp_info_client(sockfd, conn, test_params, config.use_gpu_memory, config.gpu_device_id) != 0) {
