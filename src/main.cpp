@@ -1,10 +1,53 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
+#include <stdexcept>
 #include "rdma_client.h"
 #include "rdma_server.h"
 #include "rdma_common.h"
 #include "rdma_device_discovery.h"
+
+// Parse size string with optional suffix (K, M, G for KB, MB, GB)
+// Examples: "256", "256K", "256M", "2G"
+uint64_t parse_size_string(const std::string& size_str) {
+    if (size_str.empty()) {
+        return 0;
+    }
+    
+    // Find the last character to check for suffix
+    size_t len = size_str.length();
+    char last_char = std::toupper(size_str[len - 1]);
+    
+    // Check if last character is a suffix
+    if (std::isalpha(last_char)) {
+        // Extract numeric part
+        std::string num_str = size_str.substr(0, len - 1);
+        uint64_t multiplier = 1;
+        
+        switch (last_char) {
+            case 'K':
+                multiplier = 1024ULL;
+                break;
+            case 'M':
+                multiplier = 1024ULL * 1024ULL;
+                break;
+            case 'G':
+                multiplier = 1024ULL * 1024ULL * 1024ULL;
+                break;
+            default:
+                // Invalid suffix, treat as error
+                throw std::invalid_argument("Invalid size suffix: " + std::string(1, last_char) + ". Use K, M, or G");
+        }
+        
+        uint64_t base_value = std::stoull(num_str);
+        return base_value * multiplier;
+    } else {
+        // No suffix, parse as plain number
+        return std::stoull(size_str);
+    }
+}
 
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
@@ -19,7 +62,11 @@ void print_usage(const char* program_name) {
               << "  -p, --port <num>           RDMA port number (default: 1)\n"
               << "  -t, --tcp-port <num>       TCP port for connection (default: 18515)\n"
               << "  -B, --buffer-size <size>  Buffer size in bytes (default: 4096)\n"
+              << "                            Supports suffixes: K (KB), M (MB), G (GB)\n"
+              << "                            Examples: 256M, 1G, 4096\n"
               << "  -m, --chunk-size <size>   Chunk size in bytes (default: 4096)\n"
+              << "                            Supports suffixes: K (KB), M (MB), G (GB)\n"
+              << "                            Examples: 256K, 1M, 4096\n"
               << "  -n, --iterations <num>     Number of iterations (default: 1000)\n"
               << "  -f, --in-flight <num>      Number of parallel in-flight operations (default: 1)\n"
               << "  -l, --latency             Measure latency\n"
@@ -101,7 +148,13 @@ int main(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[i], "-B") == 0 || strcmp(argv[i], "--buffer-size") == 0) {
             if (i + 1 < argc) {
-                config.buffer_size = std::stoul(argv[++i]);
+                try {
+                    config.buffer_size = parse_size_string(argv[++i]);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error parsing buffer-size: " << e.what() << std::endl;
+                    print_usage(argv[0]);
+                    return 1;
+                }
             } else {
                 std::cerr << "Error: --buffer-size requires a size" << std::endl;
                 print_usage(argv[0]);
@@ -110,7 +163,13 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--chunk-size") == 0 || 
                    strcmp(argv[i], "--message-size") == 0) {  // Keep --message-size for backward compatibility
             if (i + 1 < argc) {
-                config.chunk_size = std::stoul(argv[++i]);
+                try {
+                    config.chunk_size = parse_size_string(argv[++i]);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error parsing chunk-size: " << e.what() << std::endl;
+                    print_usage(argv[0]);
+                    return 1;
+                }
             } else {
                 std::cerr << "Error: --chunk-size requires a size" << std::endl;
                 print_usage(argv[0]);
