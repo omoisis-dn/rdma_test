@@ -137,7 +137,7 @@ int run_server(const TestConfig& config) {
         
         // Exchange test parameters and QP information
         TestParams test_params;
-        if (exchange_test_params_and_qp_info_server(client_sock, conn, test_params) != 0) {
+        if (exchange_test_params_and_qp_info_server(client_sock, conn, test_params, config.use_gpu_memory, config.gpu_device_id) != 0) {
             std::cerr << "Failed to exchange test parameters and QP info" << std::endl;
             close(client_sock);
             continue;  // Continue to next client

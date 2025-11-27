@@ -49,7 +49,7 @@ int setup_client_connection(RDMAConnection& conn, const TestConfig& config, cons
     test_params.num_in_flight = config.num_in_flight;
     
     // Exchange test parameters and QP information (socket stays open)
-    if (exchange_test_params_and_qp_info_client(sockfd, conn, test_params) != 0) {
+    if (exchange_test_params_and_qp_info_client(sockfd, conn, test_params, config.use_gpu_memory, config.gpu_device_id) != 0) {
         close(sockfd);
         ibv_dealloc_pd(conn.protection_domain);
         ibv_close_device(conn.context);
@@ -142,6 +142,12 @@ double measure_bandwidth(RDMAConnection& conn, uint32_t buffer_size, uint32_t ch
     uint32_t chunks_sent = 0;
     uint32_t chunks_completed = 0;
     
+    // Statistics for poll_send_completions
+    uint32_t poll_count = 0;
+    uint64_t total_poll_duration_ns = 0;
+    uint64_t min_poll_duration_ns = UINT64_MAX;
+    uint64_t max_poll_duration_ns = 0;
+    
     // Keep sending chunks until we've completed all iterations
     while (chunks_completed < total_chunks) {
         // Post as many sends as we can (up to num_in_flight)
@@ -159,10 +165,25 @@ double measure_bandwidth(RDMAConnection& conn, uint32_t buffer_size, uint32_t ch
         }
         
         // Poll for send completions (all completions are sends)
+        auto poll_start = std::chrono::high_resolution_clock::now();
         int num_completions = poll_send_completions(conn, total_chunks - chunks_completed);
+        auto poll_end = std::chrono::high_resolution_clock::now();
+        
         if (num_completions < 0) {
             return -1.0;
         }
+        
+        // Track poll statistics
+        poll_count++;
+        uint64_t poll_duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(poll_end - poll_start).count();
+        total_poll_duration_ns += poll_duration_ns;
+        if (poll_duration_ns < min_poll_duration_ns) {
+            min_poll_duration_ns = poll_duration_ns;
+        }
+        if (poll_duration_ns > max_poll_duration_ns) {
+            max_poll_duration_ns = poll_duration_ns;
+        }
+        
         chunks_completed += num_completions;
     }
 
@@ -174,6 +195,19 @@ double measure_bandwidth(RDMAConnection& conn, uint32_t buffer_size, uint32_t ch
     double bandwidth_gbps = (total_bytes * 8) / (duration_seconds * 1e9);
 
     std::cout << "Duration: " << std::fixed << std::setprecision(3) << duration_seconds << " seconds" << std::endl;
+    
+    // Output poll_send_completions statistics
+    if (poll_count > 0) {
+        double avg_poll_duration_us = (total_poll_duration_ns / (double)poll_count) / 1000.0;
+        double min_poll_duration_us = min_poll_duration_ns / 1000.0;
+        double max_poll_duration_us = max_poll_duration_ns / 1000.0;
+        
+        std::cout << "poll_send_completions statistics:" << std::endl;
+        std::cout << "  Call count: " << poll_count << std::endl;
+        std::cout << "  Average duration: " << std::fixed << std::setprecision(3) << avg_poll_duration_us << " microseconds" << std::endl;
+        std::cout << "  Min duration: " << std::fixed << std::setprecision(3) << min_poll_duration_us << " microseconds" << std::endl;
+        std::cout << "  Max duration: " << std::fixed << std::setprecision(3) << max_poll_duration_us << " microseconds" << std::endl;
+    }
     
     return bandwidth_gbps;
 }

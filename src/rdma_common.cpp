@@ -8,12 +8,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-#ifdef USE_GPU_MEMORY
-// Only include HIP runtime API, not device code compilation support
-#define __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime_api.h>
-#endif
-
 int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint16_t port) {
     // Get device list
     int num_devices;
@@ -83,36 +77,46 @@ int init_rdma_device(RDMAConnection& conn, const std::string& device_name, uint1
     return 0;
 }
 
-int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size) {
+int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size, bool use_gpu_memory, int gpu_device_id) {
     conn.buffer_size = buffer_size;
     
-#ifdef USE_GPU_MEMORY
-    // Allocate GPU device memory using HIP
-    hipError_t hip_err = hipMalloc(&conn.buffer, conn.buffer_size);
-    if (hip_err != hipSuccess) {
-        std::cerr << "Could not allocate GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
-        return -1;
+    if (use_gpu_memory) {
+        // Set the GPU device
+        if (gpu_device_id >= 0) {
+            hipError_t hip_err = hipSetDevice(gpu_device_id);
+            if (hip_err != hipSuccess) {
+                std::cerr << "Could not set GPU device " << gpu_device_id << ": " << hipGetErrorString(hip_err) << std::endl;
+                return -1;
+            }
+            std::cout << "Using GPU device " << gpu_device_id << std::endl;
+        }
+        
+        // Allocate GPU device memory using HIP
+        hipError_t hip_err = hipMalloc(&conn.buffer, conn.buffer_size);
+        if (hip_err != hipSuccess) {
+            std::cerr << "Could not allocate GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
+            return -1;
+        }
+        
+        // Initialize GPU buffer to zero
+        hip_err = hipMemset(conn.buffer, 0, conn.buffer_size);
+        if (hip_err != hipSuccess) {
+            std::cerr << "Could not initialize GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
+            (void)hipFree(conn.buffer);  // Ignore error during cleanup
+            return -1;
+        }
+        
+        std::cout << "Allocated " << conn.buffer_size << " bytes on GPU device" << std::endl;
+    } else {
+        // Allocate a single large buffer aligned to page size (host memory)
+        conn.buffer = aligned_alloc(4096, conn.buffer_size);
+        if (!conn.buffer) {
+            std::cerr << "Could not allocate buffer" << std::endl;
+            return -1;
+        }
+        memset(conn.buffer, 0, conn.buffer_size);
+        std::cout << "Allocated " << conn.buffer_size << " bytes on host" << std::endl;
     }
-    
-    // Initialize GPU buffer to zero
-    hip_err = hipMemset(conn.buffer, 0, conn.buffer_size);
-    if (hip_err != hipSuccess) {
-        std::cerr << "Could not initialize GPU buffer: " << hipGetErrorString(hip_err) << std::endl;
-        (void)hipFree(conn.buffer);  // Ignore error during cleanup
-        return -1;
-    }
-    
-    std::cout << "Allocated " << conn.buffer_size << " bytes on GPU device" << std::endl;
-#else
-    // Allocate a single large buffer aligned to page size (host memory)
-    conn.buffer = aligned_alloc(4096, conn.buffer_size);
-    if (!conn.buffer) {
-        std::cerr << "Could not allocate buffer" << std::endl;
-        return -1;
-    }
-    memset(conn.buffer, 0, conn.buffer_size);
-    std::cout << "Allocated " << conn.buffer_size << " bytes on host" << std::endl;
-#endif
     
     // Register the entire buffer as a single memory region
     // Note: ibv_reg_mr should work with GPU memory if GPU Direct RDMA is supported
@@ -121,24 +125,24 @@ int allocate_and_register_buffer(RDMAConnection& conn, uint32_t buffer_size) {
                                      IBV_ACCESS_REMOTE_WRITE);
     if (!conn.memory_region) {
         std::cerr << "Could not register memory region" << std::endl;
-#ifdef USE_GPU_MEMORY
-        (void)hipFree(conn.buffer);  // Ignore error during cleanup
-#else
-        free(conn.buffer);
-#endif
+        if (use_gpu_memory) {
+            (void)hipFree(conn.buffer);  // Ignore error during cleanup
+        } else {
+            free(conn.buffer);
+        }
         return -1;
     }
     
     return 0;
 }
 
-int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight) {
+int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_size, uint32_t chunk_size, uint32_t num_in_flight, bool use_gpu_memory, int gpu_device_id) {
     // Note: Protection domain should already be allocated before calling this function
     
     conn.chunk_size = chunk_size;
     conn.num_in_flight = num_in_flight;
     
-    if (allocate_and_register_buffer(conn, buffer_size) != 0) {
+    if (allocate_and_register_buffer(conn, buffer_size, use_gpu_memory, gpu_device_id) != 0) {
         std::cerr << "Could not allocate and register buffer" << std::endl;
         return -1;
     }
@@ -149,22 +153,6 @@ int create_protection_domain_resources(RDMAConnection& conn, uint32_t buffer_siz
     if (!conn.completion_queue) {
         std::cerr << "Could not create completion queue" << std::endl;
         return -1;
-    }
-    
-    // Configure CQ moderation to match ib_send_bw behavior
-    // cq_count=1 means generate event after 1 completion (minimal batching)
-    // cq_period=0 means no timeout (only count-based)
-    // Note: CQ moderation is primarily useful for interrupt-driven applications.
-    // Since we're using polling, the benefit is minimal, but we set it to match ib_send_bw.
-    struct ibv_modify_cq_attr cq_attr;
-    memset(&cq_attr, 0, sizeof(cq_attr));
-    cq_attr.attr_mask = IBV_CQ_ATTR_MODERATE;
-    cq_attr.moderate.cq_count = 1;  // Match ib_send_bw "CQ Moderation: 1"
-    cq_attr.moderate.cq_period = 0; // No timeout
-    if (ibv_modify_cq(conn.completion_queue, &cq_attr)) {
-        // CQ moderation might not be supported on all devices, so this is not fatal
-        // Just log a warning and continue
-        std::cerr << "Warning: Could not set CQ moderation (may not be supported)" << std::endl;
     }
 
     // Create queue pair attributes
@@ -202,14 +190,13 @@ void cleanup_rdma_test_resources(RDMAConnection& conn) {
         conn.memory_region = nullptr;
     }
     if (conn.buffer) {
-#ifdef USE_GPU_MEMORY
+        // Try to free as GPU memory first, then fall back to CPU memory
+        // This works because hipFree will fail if it's not GPU memory
         hipError_t hip_err = hipFree(conn.buffer);
         if (hip_err != hipSuccess) {
-            std::cerr << "Warning: hipFree failed: " << hipGetErrorString(hip_err) << std::endl;
+            // If hipFree fails, it's likely CPU memory, so use free()
+            free(conn.buffer);
         }
-#else
-        free(conn.buffer);
-#endif
         conn.buffer = nullptr;
     }
     if (conn.queue_pair) {
@@ -255,81 +242,7 @@ int poll_send_completions(RDMAConnection& conn, int max_completions) {
     return num_completions;
 }
 
-int list_rdma_devices() {
-    int num_devices;
-    struct ibv_device** device_list = ibv_get_device_list(&num_devices);
-    
-    if (!device_list) {
-        std::cerr << "Failed to get IB devices list" << std::endl;
-        return -1;
-    }
-
-    if (num_devices == 0) {
-        std::cout << "No RDMA devices found on this system." << std::endl;
-        ibv_free_device_list(device_list);
-        return 0;
-    }
-
-    std::cout << "Available RDMA devices:" << std::endl;
-    std::cout << "======================" << std::endl;
-
-    for (int i = 0; i < num_devices; i++) {
-        struct ibv_device* device = device_list[i];
-        const char* device_name = ibv_get_device_name(device);
-        
-        std::cout << "\nDevice " << i << ":" << std::endl;
-        std::cout << "  Name: " << device_name << std::endl;
-        std::cout << "  GUID: " << std::hex << ibv_get_device_guid(device) << std::dec << std::endl;
-        
-        // Try to open device to get more information
-        struct ibv_context* context = ibv_open_device(device);
-        if (context) {
-            struct ibv_device_attr device_attr;
-            if (ibv_query_device(context, &device_attr) == 0) {
-                std::cout << "  Physical Ports: " << device_attr.phys_port_cnt << std::endl;
-                std::cout << "  Max MR Size: " << device_attr.max_mr_size << " bytes" << std::endl;
-                std::cout << "  Max QP: " << device_attr.max_qp << std::endl;
-                std::cout << "  Max CQ: " << device_attr.max_cq << std::endl;
-                
-                // Query port information
-                for (uint8_t port = 1; port <= device_attr.phys_port_cnt; port++) {
-                    struct ibv_port_attr port_attr;
-                    if (ibv_query_port(context, port, &port_attr) == 0) {
-                        std::cout << "  Port " << (int)port << ":" << std::endl;
-                        std::cout << "    State: ";
-                        switch (port_attr.state) {
-                            case IBV_PORT_DOWN: std::cout << "Down"; break;
-                            case IBV_PORT_INIT: std::cout << "Initializing"; break;
-                            case IBV_PORT_ARMED: std::cout << "Armed"; break;
-                            case IBV_PORT_ACTIVE: std::cout << "Active"; break;
-                            default: std::cout << "Unknown"; break;
-                        }
-                        std::cout << std::endl;
-                        std::cout << "    LID: " << port_attr.lid << std::endl;
-                        std::cout << "    Max MTU: ";
-                        switch (port_attr.max_mtu) {
-                            case IBV_MTU_256: std::cout << "256"; break;
-                            case IBV_MTU_512: std::cout << "512"; break;
-                            case IBV_MTU_1024: std::cout << "1024"; break;
-                            case IBV_MTU_2048: std::cout << "2048"; break;
-                            case IBV_MTU_4096: std::cout << "4096"; break;
-                            default: std::cout << "Unknown"; break;
-                        }
-                        std::cout << " bytes" << std::endl;
-                    }
-                }
-            }
-            
-            ibv_close_device(context);
-        }
-    }
-
-    std::cout << "\n" << std::endl;
-    ibv_free_device_list(device_list);
-    return 0;
-}
-
-int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, TestParams& test_params) {
+int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, TestParams& test_params, bool use_gpu_memory, int gpu_device_id) {
     // Step 1: Receive test parameters from client
     TestParams client_params;
     if (recv(sockfd, &client_params, sizeof(client_params), 0) != sizeof(client_params)) {
@@ -352,7 +265,7 @@ int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, Te
     test_params = client_params;
     
     // Step 2: Now initialize buffers with the received parameters
-    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight) != 0) {
+    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight, use_gpu_memory, gpu_device_id) != 0) {
         std::cerr << "Failed to create protection domain resources" << std::endl;
         return -1;
     }
@@ -409,7 +322,7 @@ int exchange_test_params_and_qp_info_server(int sockfd, RDMAConnection& conn, Te
     return 0;
 }
 
-int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, const TestParams& test_params) {
+int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, const TestParams& test_params, bool use_gpu_memory, int gpu_device_id) {
     // Step 1: Send test parameters to server
     if (send(sockfd, &test_params, sizeof(test_params), 0) != sizeof(test_params)) {
         std::cerr << "Failed to send test parameters to server" << std::endl;
@@ -421,7 +334,7 @@ int exchange_test_params_and_qp_info_client(int sockfd, RDMAConnection& conn, co
               << ", num_in_flight=" << test_params.num_in_flight << std::endl;
     
     // Step 2: Now initialize buffers with the same parameters
-    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight) != 0) {
+    if (create_protection_domain_resources(conn, test_params.buffer_size, test_params.chunk_size, test_params.num_in_flight, use_gpu_memory, gpu_device_id) != 0) {
         std::cerr << "Failed to create protection domain resources" << std::endl;
         return -1;
     }
